@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/heers-it/lightningfeed/internal/model"
@@ -204,25 +205,39 @@ type rawStroke struct {
 type flexFloat struct {
 	value float64
 	err   error
+
+	// set records that the field was present in the payload at all.
+	//
+	// encoding/json only calls UnmarshalJSON for a field that is actually present,
+	// so an absent coordinate leaves value at its zero and err nil — indistinguishable
+	// from a coordinate of 0. A field rename upstream, or a stroke object that omits
+	// it, would otherwise be published as lightning at the null island.
+	set bool
 }
 
 func (f *flexFloat) UnmarshalJSON(b []byte) error {
-	if len(b) == 0 {
+	f.set = true
+	trimmed := strings.TrimSpace(string(b))
+
+	if len(trimmed) == 0 {
 		f.err = fmt.Errorf("empty numeric value")
 		return nil
 	}
 
-	if b[0] == '"' {
+	if trimmed[0] == '"' {
 		var s string
-		if err := json.Unmarshal(b, &s); err != nil {
+		if err := json.Unmarshal([]byte(trimmed), &s); err != nil {
 			f.err = err
 			return nil
 		}
-		if s == "" {
-			f.value = 0
+		// An empty or blank string is a missing coordinate, not a zero one.
+		// Decoding it to 0.0 placed the stroke in the Gulf of Guinea and reported it
+		// as real lightning, with no counter moved and nothing in the logs.
+		if strings.TrimSpace(s) == "" {
+			f.err = fmt.Errorf("empty string is not a coordinate")
 			return nil
 		}
-		v, err := strconv.ParseFloat(s, 64)
+		v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 		if err != nil {
 			f.err = fmt.Errorf("%q is not a number", s)
 			return nil
@@ -231,8 +246,17 @@ func (f *flexFloat) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 
+	// encoding/json treats a literal null as "leave the destination alone", so
+	// unmarshalling null into a float succeeds and yields 0. That is precisely the
+	// outcome this type exists to prevent, so null has to be rejected by name
+	// rather than left to the range check that 0 passes.
+	if trimmed == "null" {
+		f.err = fmt.Errorf("null is not a coordinate")
+		return nil
+	}
+
 	var v float64
-	if err := json.Unmarshal(b, &v); err != nil {
+	if err := json.Unmarshal([]byte(trimmed), &v); err != nil {
 		f.err = err
 		return nil
 	}
@@ -302,6 +326,17 @@ func ParseFrame(raw []byte) (Frame, error) {
 func (rs rawStroke) normalise() (model.Stroke, error) {
 	// A coordinate that would not parse is reported here rather than aborting
 	// the frame, so one unusable value costs one stroke.
+	//
+	// An absent coordinate is rejected too, and separately from an unparseable
+	// one. It has to be: 0 is a legal latitude, so "missing" and "zero" decode
+	// identically without the presence flag, and a stroke with no coordinates at
+	// all would be archived and published as lightning off the coast of Africa.
+	if !rs.Lat.set {
+		return model.Stroke{}, fmt.Errorf("latitude is absent")
+	}
+	if !rs.Lon.set {
+		return model.Stroke{}, fmt.Errorf("longitude is absent")
+	}
 	if rs.Lat.err != nil {
 		return model.Stroke{}, fmt.Errorf("latitude: %w", rs.Lat.err)
 	}
