@@ -262,7 +262,14 @@ func TestRejectsMalformedFramesWithoutLosingTheConnection(t *testing.T) {
 // A coordinate outside the valid range cannot be located on earth. Accepting it
 // would place the stroke nowhere, and it would be counted as outside the region
 // rather than reported as bad data.
-func TestRejectsImpossibleCoordinates(t *testing.T) {
+//
+// The stroke is rejected — never published — but the frame it arrived in is not.
+// The upstream batches up to 500 strokes per frame, so failing the whole batch
+// over one bad coordinate would discard every good stroke beside it. The two
+// failure modes are kept apart on purpose: a frame that will not decode is an
+// outage and returns an error, while a stroke that will not normalise is
+// dropped alone and counted in Frame.Rejected.
+func TestRejectsImpossibleCoordinatesWithoutLosingTheRestOfTheBatch(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		raw  string
@@ -273,10 +280,51 @@ func TestRejectsImpossibleCoordinates(t *testing.T) {
 		{"latitude is text", `{"strokes":[{"time":1,"lat":"north","lon":0,"src":2,"id":1}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := ParseFrame([]byte(tc.raw)); err == nil {
-				t.Errorf("ParseFrame(%s) = nil error, want error", tc.raw)
+			frame, err := ParseFrame([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("ParseFrame(%s) = error, want the frame decoded with the bad stroke dropped: %v", tc.raw, err)
+			}
+			if len(frame.Strokes) != 0 {
+				t.Errorf("ParseFrame kept %d stroke(s); an unusable coordinate must never be published", len(frame.Strokes))
+			}
+			if frame.Rejected != 1 {
+				t.Errorf("Rejected = %d, want 1", frame.Rejected)
+			}
+			if frame.RejectReason == "" {
+				t.Error("RejectReason is empty; the operator is left with no reason for the loss")
 			}
 		})
+	}
+}
+
+// One bad stroke in a large batch must cost one stroke, not the whole batch.
+// The upstream caps a frame at 500 strokes, so the difference between rejecting
+// the frame and rejecting the stroke is 499 dropped detections of real
+// lightning.
+func TestKeepsGoodStrokesAroundABadOne(t *testing.T) {
+	raw := `{"time":1791106720,"strokes":[
+		{"time":1791106720000,"lat":35.33,"lon":24.49,"src":2,"id":1},
+		{"time":1791106721000,"lat":35.34,"lon":24.50,"src":2,"id":2},
+		{"time":1791106722000,"lat":95.00,"lon":24.49,"src":2,"id":3},
+		{"time":1791106723000,"lat":35.35,"lon":24.49,"src":2,"id":4},
+		{"time":1791106724000,"lat":35.36,"lon":24.49,"src":2,"id":5}
+	]}`
+
+	frame, err := ParseFrame([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseFrame: %v", err)
+	}
+	if len(frame.Strokes) != 4 {
+		t.Errorf("kept %d strokes, want 4: one bad coordinate must not discard its neighbours", len(frame.Strokes))
+	}
+	if frame.Rejected != 1 {
+		t.Errorf("Rejected = %d, want 1", frame.Rejected)
+	}
+
+	for _, s := range frame.Strokes {
+		if s.StrokeID == 3 {
+			t.Error("the stroke with the impossible latitude was published")
+		}
 	}
 }
 

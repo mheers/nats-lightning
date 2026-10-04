@@ -142,6 +142,18 @@ type Frame struct {
 	Strokes []model.Stroke
 
 	Hello Hello
+
+	// Rejected counts strokes dropped from an otherwise decodable frame
+	// because they could not be normalised, and RejectReason is the first
+	// reason it happened.
+	//
+	// The upstream batches up to 500 strokes per frame, so the two failure
+	// modes have to be told apart. A frame that will not decode is an outage
+	// and returns an error. A single stroke with an impossible coordinate is a
+	// hiccup: rejecting the whole frame would throw away 499 good strokes to
+	// report one bad one, and the connection is still perfectly healthy.
+	Rejected     int
+	RejectReason string
 }
 
 // rawFrame mirrors the upstream JSON. Fields absent from a frame are simply
@@ -183,41 +195,66 @@ type rawStroke struct {
 // The upstream is inconsistent about this between its two transports, and a
 // plain float64 would quietly yield 0.0 for the string form, placing every
 // stroke at the null island and counting it as outside the region.
-type flexFloat float64
+//
+// An unusable value is recorded rather than returned as an error. Returning one
+// would abort the decode of the entire frame, because encoding/json stops at the
+// first custom unmarshaller that fails — which would throw away the other 499
+// strokes in the batch over one bad coordinate. Holding the failure here lets
+// normalise reject that single stroke and the caller keep the rest.
+type flexFloat struct {
+	value float64
+	err   error
+}
 
 func (f *flexFloat) UnmarshalJSON(b []byte) error {
 	if len(b) == 0 {
-		return fmt.Errorf("upstream: empty numeric value")
+		f.err = fmt.Errorf("empty numeric value")
+		return nil
 	}
+
 	if b[0] == '"' {
 		var s string
 		if err := json.Unmarshal(b, &s); err != nil {
-			return err
+			f.err = err
+			return nil
 		}
 		if s == "" {
-			*f = 0
+			f.value = 0
 			return nil
 		}
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
-			return fmt.Errorf("upstream: %q is not a number", s)
+			f.err = fmt.Errorf("%q is not a number", s)
+			return nil
 		}
-		*f = flexFloat(v)
+		f.value = v
 		return nil
 	}
 
 	var v float64
 	if err := json.Unmarshal(b, &v); err != nil {
-		return err
+		f.err = err
+		return nil
 	}
-	*f = flexFloat(v)
+	f.value = v
 	return nil
 }
 
 // ParseFrame decodes one upstream WebSocket frame.
 //
-// A malformed frame returns an error but must not be treated as fatal by the
-// caller: one bad frame is a hiccup, not an outage.
+// Two failure modes are deliberately distinguished, because they call for
+// opposite responses:
+//
+//   - The frame will not decode. ParseFrame returns an error. The caller should
+//     count it, log it, and keep reading: one bad frame is a hiccup, not an
+//     outage.
+//   - The frame decodes but one stroke in it is unusable. That stroke is
+//     dropped on its own and reported in Frame.Rejected, and the rest of the
+//     batch is delivered. Frames carry up to 500 strokes, so failing the whole
+//     frame over one bad coordinate would discard every good stroke alongside
+//     it. An impossible coordinate is still rejected rather than published: it
+//     would place the stroke nowhere, and it would be counted as outside the
+//     region rather than reported as bad data.
 func ParseFrame(raw []byte) (Frame, error) {
 	var rf rawFrame
 	if err := json.Unmarshal(raw, &rf); err != nil {
@@ -236,7 +273,11 @@ func ParseFrame(raw []byte) (Frame, error) {
 		for i, rs := range rf.Strokes {
 			s, err := rs.normalise()
 			if err != nil {
-				return Frame{}, fmt.Errorf("upstream: stroke %d: %w", i, err)
+				if frame.RejectReason == "" {
+					frame.RejectReason = fmt.Sprintf("stroke %d: %v", i, err)
+				}
+				frame.Rejected++
+				continue
 			}
 			frame.Strokes = append(frame.Strokes, s)
 		}
@@ -259,8 +300,16 @@ func ParseFrame(raw []byte) (Frame, error) {
 
 // normalise converts one wire stroke into the internal representation.
 func (rs rawStroke) normalise() (model.Stroke, error) {
-	lat := float64(rs.Lat)
-	lon := float64(rs.Lon)
+	// A coordinate that would not parse is reported here rather than aborting
+	// the frame, so one unusable value costs one stroke.
+	if rs.Lat.err != nil {
+		return model.Stroke{}, fmt.Errorf("latitude: %w", rs.Lat.err)
+	}
+	if rs.Lon.err != nil {
+		return model.Stroke{}, fmt.Errorf("longitude: %w", rs.Lon.err)
+	}
+
+	lat, lon := rs.Lat.value, rs.Lon.value
 
 	if math.IsNaN(lat) || math.IsNaN(lon) {
 		return model.Stroke{}, fmt.Errorf("coordinate is not a number: lat=%v lon=%v", lat, lon)
