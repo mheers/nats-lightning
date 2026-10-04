@@ -201,12 +201,21 @@ func (m *Metrics) SetLeader(leader bool) {
 	m.LeadershipHeld.Set(0)
 }
 
-// ObserveReconnect counts a reconnect, labelled by host and reason.
+// ObserveReconnect counts reconnects, labelled by host and reason.
+//
+// n is the number observed since the previous report rather than a single event.
+// The upstream's counters are monotonic totals and the metric wants increments, so
+// the caller reports a delta. Counting one per poll instead under-reported by
+// exactly the factor that matters: reconnects arrive in bursts during an outage,
+// which is the only time anyone looks at this counter, and a burst of five
+// between two reports advanced it by one.
 //
 // The label set is fixed rather than free-form so a mislabelled call cannot
 // quietly invent a new time series per upstream URL variant.
-func (m *Metrics) ObserveReconnect(host, reason string) {
-	m.UpstreamReconnects.WithLabelValues(host, reason).Inc()
+func (m *Metrics) ObserveReconnect(host, reason string, n int64) {
+	if n > 0 {
+		m.UpstreamReconnects.WithLabelValues(host, reason).Add(float64(n))
+	}
 }
 
 // ObserveMalformedFrames adds to the count of frames that failed to decode.

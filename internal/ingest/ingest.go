@@ -334,7 +334,7 @@ func reportUpstream(
 			prev.rejected = n
 		}
 		if n := client.Reconnects(); n > prev.reconnects {
-			metrics.ObserveReconnect("upstream", "session_ended")
+			metrics.ObserveReconnect("upstream", "session_ended", n-prev.reconnects)
 			prev.reconnects = n
 		}
 	}
