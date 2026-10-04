@@ -42,6 +42,19 @@ const (
 
 	// DefaultRetention is how long strokes stay in SQLite.
 	DefaultRetention = 7 * 24 * time.Hour
+
+	// DefaultPublishAttempts is how many times a publish is tried before the
+	// process gives up.
+	//
+	// Three attempts, because the thing being absorbed is a broker hiccup
+	// measured in milliseconds and the alternative — exiting on the first
+	// failure — costs a reconnect to an upstream that throttles them.
+	DefaultPublishAttempts = 3
+
+	// DefaultPublishBackoff is the pause between publish attempts. It is short
+	// enough that a brief outage is invisible to a consumer and long enough not
+	// to spin.
+	DefaultPublishBackoff = 250 * time.Millisecond
 )
 
 // Config is the fully resolved configuration.
@@ -75,6 +88,11 @@ type Config struct {
 	Retention  time.Duration
 	PruneEvery time.Duration
 
+	// PublishAttempts and PublishBackoff bound the retry applied to a failed
+	// publish.
+	PublishAttempts int
+	PublishBackoff  time.Duration
+
 	// Leadership
 	LeaderElect bool
 	LeaderKey   string
@@ -83,6 +101,32 @@ type Config struct {
 	MetricsAddr string
 	LogLevel    slog.Level
 	LogFormat   string
+
+	// Which region components the operator actually supplied.
+	//
+	// These record presence, not value. A region at latitude 0 or longitude 0
+	// is valid, so "was this flag given" cannot be recovered afterwards from the
+	// parsed number — only zero means both "unset" and "on the equator".
+	regionLatSet    bool
+	regionLonSet    bool
+	regionRadiusSet bool
+}
+
+// markSupplied records which region components were given on the command line.
+//
+// flag.Visit reports only the flags actually present in the argument list, which
+// is exactly the distinction that a value comparison cannot make.
+func (c *Config) markSupplied(fs *flag.FlagSet) {
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "region-lat":
+			c.regionLatSet = true
+		case "region-lon":
+			c.regionLonSet = true
+		case "region-radius-km":
+			c.regionRadiusSet = true
+		}
+	})
 }
 
 // RegionConfigured reports whether a region was set.
@@ -131,6 +175,8 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		SQLitePath:       "/var/lib/lightningfeed/lightningfeed.db",
 		Retention:        DefaultRetention,
 		PruneEvery:       time.Hour,
+		PublishAttempts:  DefaultPublishAttempts,
+		PublishBackoff:   DefaultPublishBackoff,
 		LeaderElect:      true,
 		LeaderKey:        "lightningfeed/leader",
 		MetricsAddr:      ":9109",
@@ -167,16 +213,24 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	fs.DurationVar(&cfg.Retention, "retention", cfg.Retention, "how long to keep strokes in SQLite")
 	fs.DurationVar(&cfg.PruneEvery, "prune-every", cfg.PruneEvery, "how often to prune old strokes")
 
+	fs.IntVar(&cfg.PublishAttempts, "publish-attempts", cfg.PublishAttempts,
+		"how many times to try publishing a stroke before failing")
+	fs.DurationVar(&cfg.PublishBackoff, "publish-backoff", cfg.PublishBackoff,
+		"pause between publish attempts")
+
 	fs.BoolVar(&cfg.LeaderElect, "leader-elect", cfg.LeaderElect, "require leadership before connecting upstream")
 	fs.StringVar(&cfg.LeaderKey, "leader-key", cfg.LeaderKey, "KV key holding the leadership lease")
 
 	fs.StringVar(&cfg.MetricsAddr, "metrics-addr", cfg.MetricsAddr, "metrics listen address")
 	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "log format: json or text")
-	logLevel := fs.String("log-level", "info", "log level: debug, info, warn or error")
-	// Applied after parsing so an invalid value is reported by finalize, in the
-	// same place and the same way as every other configuration error.
-	defer func() {}()
-	_ = logLevel
+
+	// Log level is registered as a string flag and resolved below, for two
+	// reasons: slog.Level has no flag.Value implementation, and the environment
+	// override has to be able to win. Binding it straight to a string flag whose
+	// value was then discarded is what left --log-level silently doing nothing
+	// while the environment variable worked.
+	var logLevel string
+	fs.StringVar(&logLevel, "log-level", cfg.LogLevel.String(), "log level: debug, info, warn or error")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -185,8 +239,19 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	// An unparseable environment value must be an error, not a silent no-op: a
 	// typo in a unit file would otherwise leave the default in place and the
 	// bridge quietly running with the wrong region.
+	//
+	// This runs after the flag is applied and not before, because the environment
+	// is meant to win. Applying --log-level again here would overwrite whatever
+	// applyEnv just set, which made LIGHTNINGFEED_LOG_LEVEL silently lose to
+	// --log-level while every other variable correctly won — the one setting
+	// where the documented precedence was a lie.
 	if err := applyEnv(getenv, cfg); err != nil {
 		return nil, err
+	}
+	cfg.markSupplied(fs)
+
+	if err := setLevel(&cfg.LogLevel, logLevel); err != nil {
+		return nil, fmt.Errorf("config: --log-level: %w", err)
 	}
 
 	if err := cfg.finalize(); err != nil {
@@ -207,9 +272,18 @@ var envOverrides = []struct {
 	{"LIGHTNINGFEED_NATS_URL", func(c *Config, v string) error { c.NATSURL = v; return nil }},
 	{"LIGHTNINGFEED_STREAM", func(c *Config, v string) error { c.Stream = v; return nil }},
 	{"LIGHTNINGFEED_REGION_NAME", func(c *Config, v string) error { c.RegionName = v; return nil }},
-	{"LIGHTNINGFEED_REGION_LAT", func(c *Config, v string) error { return setFloat(&c.Region.Lat, v) }},
-	{"LIGHTNINGFEED_REGION_LON", func(c *Config, v string) error { return setFloat(&c.Region.Lon, v) }},
-	{"LIGHTNINGFEED_REGION_RADIUS_KM", func(c *Config, v string) error { return setFloat(&c.Region.RadiusKm, v) }},
+	{"LIGHTNINGFEED_REGION_LAT", func(c *Config, v string) error {
+		c.regionLatSet = true
+		return setFloat(&c.Region.Lat, v)
+	}},
+	{"LIGHTNINGFEED_REGION_LON", func(c *Config, v string) error {
+		c.regionLonSet = true
+		return setFloat(&c.Region.Lon, v)
+	}},
+	{"LIGHTNINGFEED_REGION_RADIUS_KM", func(c *Config, v string) error {
+		c.regionRadiusSet = true
+		return setFloat(&c.Region.RadiusKm, v)
+	}},
 	{"LIGHTNINGFEED_BOUNDARY_POLICY", func(c *Config, v string) error {
 		p, err := geo.ParseBoundaryPolicy(v)
 		if err != nil {
@@ -229,6 +303,17 @@ var envOverrides = []struct {
 	}},
 	{"LIGHTNINGFEED_SQLITE", func(c *Config, v string) error { c.SQLitePath = v; return nil }},
 	{"LIGHTNINGFEED_RETENTION", func(c *Config, v string) error { return setDuration(&c.Retention, v) }},
+	{"LIGHTNINGFEED_PUBLISH_ATTEMPTS", func(c *Config, v string) error {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return err
+		}
+		c.PublishAttempts = n
+		return nil
+	}},
+	{"LIGHTNINGFEED_PUBLISH_BACKOFF", func(c *Config, v string) error {
+		return setDuration(&c.PublishBackoff, v)
+	}},
 	{"LIGHTNINGFEED_LEADER_ELECT", func(c *Config, v string) error { return setBool(&c.LeaderElect, v) }},
 	{"LIGHTNINGFEED_METRICS_ADDR", func(c *Config, v string) error { c.MetricsAddr = v; return nil }},
 	{"LIGHTNINGFEED_LOG_LEVEL", func(c *Config, v string) error { return setLevel(&c.LogLevel, v) }},
@@ -253,14 +338,19 @@ func (c *Config) finalize() error {
 	// A region needs all three parts. Two of three would silently mean
 	// world-wide, which is the opposite of what an operator typing only a
 	// latitude intends.
+	//
+	// "Supplied" is tracked explicitly rather than inferred from the value being
+	// non-zero. A region on the equator or the prime meridian is perfectly
+	// valid, and treating a legitimate 0 as "not supplied" rejected it with a
+	// message about a missing part that was in fact present.
 	parts := 0
-	if c.Region.Lat != 0 {
+	if c.regionLatSet {
 		parts++
 	}
-	if c.Region.Lon != 0 {
+	if c.regionLonSet {
 		parts++
 	}
-	if c.Region.RadiusKm != 0 {
+	if c.regionRadiusSet {
 		parts++
 	}
 
@@ -314,6 +404,18 @@ func (c *Config) finalize() error {
 	}
 	if c.SourceMask == 0 {
 		return fmt.Errorf("config: src-mask selects no network")
+	}
+	if c.PublishAttempts < 1 {
+		return fmt.Errorf("config: publish-attempts must be at least 1, got %d", c.PublishAttempts)
+	}
+	if c.PublishBackoff < 0 {
+		return fmt.Errorf("config: publish-backoff must not be negative, got %v", c.PublishBackoff)
+	}
+	if c.HandshakeTimeout <= 0 {
+		return fmt.Errorf("config: handshake-timeout must be positive, got %v", c.HandshakeTimeout)
+	}
+	if c.PruneEvery <= 0 {
+		return fmt.Errorf("config: prune-every must be positive, got %v", c.PruneEvery)
 	}
 	return nil
 }
