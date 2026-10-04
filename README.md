@@ -83,13 +83,32 @@ wins, so secrets need not appear in a unit file:
 | Flag | Environment |
 |---|---|
 | `--nats-url` | `LIGHTNINGFEED_NATS_URL` |
+| `--stream` | `LIGHTNINGFEED_STREAM` |
 | `--region-lat` / `--region-lon` / `--region-radius-km` | `LIGHTNINGFEED_REGION_LAT` … |
 | `--boundary-policy` | `LIGHTNINGFEED_BOUNDARY_POLICY` |
 | `--sqlite` | `LIGHTNINGFEED_SQLITE` |
 | `--src-mask` | `LIGHTNINGFEED_SRC_MASK` |
+| `--publish-attempts` / `--publish-backoff` | `LIGHTNINGFEED_PUBLISH_ATTEMPTS` … |
 | `--log-level` / `--log-format` | `LIGHTNINGFEED_LOG_LEVEL` … |
 
-Omit all three `--region-*` flags for a world-wide feed.
+Omit all three `--region-*` flags for a world-wide feed. Supplying only some of
+them is an error rather than a silent world-wide feed, so a typo cannot quietly
+turn a regional deployment into a global one.
+
+A region on the equator or the prime meridian is legitimate: a `0` is treated as
+supplied, not missing.
+
+**JetStream is not optional.** The publisher registers a message id per stroke and
+relies on the broker's duplicate window to absorb a reconnect replay, which Core
+NATS cannot do; startup fails outright if JetStream is unavailable. There is
+deliberately no `--jetstream` flag, because it could only ever select a failure.
+
+**A failed publish is retried, then fatal.** `--publish-attempts` (default 3)
+tries with `--publish-backoff` (default 250 ms) between attempts, so a brief NATS
+blip is invisible and a sustained outage still stops the pipeline. Retrying
+forever would turn an outage into a silent, unbounded backlog; not retrying at
+all would drop strokes over a hiccup. Exhausting the attempts is fatal on
+purpose.
 
 ### Other commands
 
@@ -104,8 +123,49 @@ lightningfeed history --sqlite=/var/lib/lightningfeed/lightningfeed.db \
   --since=24h
 ```
 
+`cells` prints **every source the `--src-mask` selects**, because the subject
+carries the source code and the two networks issue independent id sequences:
+
+```
+$ lightningfeed cells --region-name=munich --region-lat=48 --region-lon=11 \
+    --region-radius-km=1 --src-mask=6
+munich: 1 cells, radius 1 km around 48.0000,11.0000
+sources: src.1, src.2
+
+blitzortung.org
+lightning.v1.src.1.cell.u0xc4
+
+lightningmaps.org
+lightning.v1.src.2.cell.u0xc4
+```
+
+The reserved and testing mask bits carry no data and are skipped, since printing
+them would list subjects nothing is ever published to.
+
 `history` reads SQLite rather than NATS because a **radius query is not something
 subject filtering can express**.
+
+### There is no upstream failover
+
+There is deliberately no failover URL, and `live2` is never dialled
+automatically. The two servers issue **independent id sequences** — the same
+minute showed a last id near 1.48M on one and near 17.8M on the other — so a
+cursor carried between them is not a resume but a claim about an unrelated
+sequence, and the `(src, id)` identity filter cannot help because colliding ids
+from different servers name different strokes.
+
+The stored cursor therefore records which server issued it, and on startup:
+
+| Stored cursor | Behaviour |
+|---|---|
+| from the configured upstream | resumed; no five-minute replay |
+| from a **different** upstream | refused, with a warning; starts cold |
+
+Starting cold is safe rather than fatal: the backfill window drops the replay, so
+the cost of a repointed `--upstream-url` is one window of backfill, not a
+pipeline that will not start. Republishing history as live data — the one failure
+this whole pipeline exists to prevent — cannot happen either way. If you want the
+second server, set `--upstream-url` to it deliberately and accept the cold start.
 
 ## Consuming
 
@@ -190,11 +250,29 @@ the null island.
 
 | Metric | Watches |
 |---|---|
+| `lightningfeed_upstream_connected` | 1 while an upstream connection is live, 0 while reconnecting |
 | `lightningfeed_upstream_last_message_age_seconds` | distinguishes quiet from dead |
+| `lightningfeed_reconnects_total{host,reason}` | reconnection attempts |
+| `lightningfeed_malformed_frames_total` | frames that failed to decode entirely |
+| `lightningfeed_rejected_strokes_total` | strokes dropped from an otherwise decodable frame |
 | `lightningfeed_dropped_total{reason}` | `replay`, `outside_region`, `bad_coordinate`, `store_error` |
 | `lightningfeed_leader` | whether this process is the one connecting |
 | `lightningfeed_strokes_total`, `lightningfeed_published_total` | volume |
+| `lightningfeed_publish_lag_ms` | stroke time to publication |
 | `lightningfeed_store_rows` | archive depth |
+| `lightningfeed_store_pruned_total` | retention pruning |
+| `lightningfeed_config_info{region}` | the region actually in force |
+
+`upstream_last_message_age_seconds` and `upstream_connected` are deliberately
+separate. Age alone cannot distinguish a quiet region from a dead connection, and
+the connection gauge cannot survive the moment a socket drops — merging them
+would have made the one signal that matters during an outage read as healthy.
+
+`malformed_frames_total` and `rejected_strokes_total` are separate for the same
+reason, in the other direction: a frame that decodes but contains one
+unusable coordinate is *not* a malformed frame. The decoder rejects the offending
+stroke and keeps its siblings, so the two counters answer "was the stream
+unreadable" and "how much of a readable stream was unusable" independently.
 
 Alerts worth having: `upstream_last_message_age > 60s` for 5 min;
 `dropped/published > 5%`; no leader for 2 min.
