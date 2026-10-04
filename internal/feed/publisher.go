@@ -288,33 +288,13 @@ func (p *Publisher) SubjectFor(s model.Stroke) (string, error) {
 	return p.opts.SubjectPrefix + ".src." + strconv.Itoa(int(s.Src)) + ".cell." + cell, nil
 }
 
-// PublishBatch sends a slice of strokes, returning the first error.
-func (p *Publisher) PublishBatch(ctx context.Context, strokes []model.Stroke) error {
-	for _, s := range strokes {
-		if err := p.Publish(ctx, s); err != nil {
-			return err
-		}
-	}
-	return nil
+// AllowsCell reports whether a geohash is within this publisher's restriction.
+//
+// It exists because the ingest stage tests every stroke's cell against the region
+// before publishing, and the publisher already holds the membership set. Handing
+// that set out through Cells and CellSet made each stroke pay for a slice copy and
+// a fresh map, which is a full allocation per message on the hottest path in the
+// process.
+func (p *Publisher) AllowsCell(cell string) bool {
+	return geo.InCells(p.cells, cell)
 }
-
-// Sync waits for the server to acknowledge everything published so far.
-func (p *Publisher) Sync(ctx context.Context) error {
-	if err := p.opts.NATS.FlushWithContext(ctx); err != nil {
-		return fmt.Errorf("feed: flushing: %w", err)
-	}
-	return nil
-}
-
-// Cells returns the geohash cells this publisher is restricted to, if any.
-func (p *Publisher) Cells() []string {
-	out := make([]string, 0, len(p.cells))
-	for c := range p.cells {
-		out = append(out, c)
-	}
-	return out
-}
-
-// CellSet converts a cell list to a membership set for the ingest stage, which
-// needs to test a stroke's cell without reaching into the publisher's internals.
-func CellSet(cells []string) map[string]struct{} { return geo.ToSet(cells) }

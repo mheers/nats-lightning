@@ -31,6 +31,22 @@ import (
 // importing the whole publisher.
 const feedSubjectPrefix = feed.SubjectPrefix
 
+// Runner is a handle to a running pipeline.
+//
+// It exists so the resolved address of the metrics server can reach the caller.
+// A port of 0 asks the kernel to choose one, and the chosen port is not knowable
+// from the configuration, so anything that needs to scrape the exposition — a
+// test, or an operator running a second instance on an ephemeral port — would
+// otherwise have nowhere to connect.
+type Runner struct {
+	// MetricsAddr is the address the metrics and health server bound to.
+	MetricsAddr string
+
+	// Metrics is the metric set, for callers that want to read it directly rather
+	// than scrape the exposition.
+	Metrics *obs.Metrics
+}
+
 // Run executes the bridge until ctx ends.
 //
 // The order matters and is deliberate:
@@ -41,6 +57,21 @@ const feedSubjectPrefix = feed.SubjectPrefix
 //  4. start serving metrics and health, so the process is observable while it works
 //  5. connect upstream and stream
 func Run(ctx context.Context, cfg *config.Config) error {
+	return RunWith(ctx, cfg, nil)
+}
+
+// RunWith is Run with a callback for the moment the pipeline becomes observable.
+//
+// ready is called once the metrics server is listening and leadership is held,
+// which is before the upstream connection is established: connecting takes at
+// least the configured handshake timeout, and a caller that could not learn where
+// the metrics server ended up would have no way to watch a slow connect happen.
+// It is called from the goroutine running the pipeline, so it should not block.
+//
+// The callback exists because the resolved metrics address is otherwise
+// unreachable. A port of 0 asks the kernel to choose one, and the configuration
+// never learns which, so a caller cannot scrape the exposition without being told.
+func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error {
 	logger := cfg.Logger()
 
 	cells, err := cfg.Cells()
@@ -111,6 +142,30 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("loading the resume cursor: %w", err)
 	}
+
+	// The cursor is only meaningful against the upstream that issued those ids.
+	//
+	// The two upstream servers run independent id sequences — the same minute
+	// showed a last id near 1.48M on one and near 17.8M on the other — so a
+	// cursor carried across is not a resume, it is a claim about a sequence that
+	// has nothing to do with this server. The upstream treats `i` as a hint and
+	// replays its window regardless, but the identity filter cannot help either:
+	// it keys on (src, id), and the ids of a different server name different
+	// strokes that happen to collide.
+	//
+	// Refusing to start is the honest response. Continuing would republish
+	// history as live data, which is the one failure this whole pipeline exists
+	// to prevent. Starting cold instead is safe — the backfill window drops the
+	// replay — so the operator's options are to point back at the original
+	// upstream or to accept a cold start deliberately.
+	if cursor.Server != "" && cursor.Server != cfg.UpstreamURL {
+		logger.Warn("stored cursor belongs to a different upstream; starting cold rather than resuming",
+			"cursor_server", cursor.Server,
+			"configured_upstream", cfg.UpstreamURL,
+			"note", "the two upstreams issue independent id sequences, so the stored ids mean nothing here")
+		cursor = store.Cursor{Sources: map[model.Source]int64{}}
+	}
+
 	if len(cursor.Sources) > 0 {
 		logger.Info("resuming from the stored cursor", "sources", cursor.Sources, "server", cursor.Server)
 	} else {
@@ -129,18 +184,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	metrics := obs.NewMetrics(cfg.RegionName)
-	metrics.UpstreamConnected.Set(0)
-	if lock != nil {
-		metrics.LeadershipHeld.Set(1)
-	}
+	metrics.SetConnected(false)
+	metrics.SetLeader(lock != nil)
 
 	storeHealthy := true
-	metrics.StoreRows = obs.GaugeFunc(func() float64 {
-		n, err := db.Count(context.Background(), time.Time{})
-		if err != nil {
-			return 0
-		}
-		return float64(n)
+
+	filter := dedup.New(dedup.Options{
+		ReconnectWindow: cfg.BackfillDrop,
+		TTL:             cfg.DedupeTTL,
 	})
 
 	client := upstream.New(upstream.Options{
@@ -153,7 +204,22 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		ReconnectMin:     cfg.ReconnectMin,
 		ReconnectMax:     cfg.ReconnectMax,
 		Logger:           logger,
+		// Open the backfill window on every connection. Without this the first
+		// of the four replay-suppression layers never runs at all: the upstream
+		// replays about five minutes of history on each connect, and those
+		// strokes are indistinguishable from live ones by identity alone on a
+		// cold start, where the filter has never seen them.
+		OnSessionStart: filter.StartConnection,
 	})
+
+	// Register the gauges that close over the store and the client. They cannot
+	// be built in NewMetrics, and a collector that is built but not registered
+	// exports nothing at all.
+	metrics.Register(
+		metrics.LastMessageAgeGauge(client.LastMessage, client.Connected),
+		obs.StoreRowsGauge(func() (int64, error) { return db.Count(context.Background(), time.Time{}) }),
+	)
+	metrics.SetRegionInfo(cfg.RegionName)
 
 	server, err := obs.StartServer(ctx, cfg.MetricsAddr, metrics.Handler(), obs.Probe{
 		Connected:    client.Connected,
@@ -168,12 +234,17 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("starting the metrics server: %w", err)
 	}
 	defer server.Close()
+
+	// Log the address the server actually bound to, not the one requested: with
+	// a port of 0 the two differ, and the resolved one is the only one anyone can
+	// connect to.
 	logger.Info("serving metrics and health", "addr", server.Addr())
 
-	filter := dedup.New(dedup.Options{
-		ReconnectWindow: cfg.BackfillDrop,
-		TTL:             cfg.DedupeTTL,
-	})
+	// From here the process is observable, which is the point of starting the
+	// server before the upstream connection rather than after.
+	if ready != nil {
+		ready(&Runner{MetricsAddr: server.Addr(), Metrics: metrics})
+	}
 
 	// Renew the lease alongside the stream. Losing it means another process is
 	// now the writer, and continuing would mean two writers on one database and
@@ -190,6 +261,13 @@ func Run(ctx context.Context, cfg *config.Config) error {
 			}
 		}()
 	}
+
+	// Report connection state and upstream counters into the metrics. The
+	// client's counters are monotonic totals and the gauges are point-in-time
+	// state, so neither can be wired once at startup: the connected gauge sat at
+	// zero for the life of the process, and the reject and reconnect counters
+	// were never incremented at all.
+	go reportUpstream(leaderCtx, client, lock, metrics)
 
 	// Persist the resume cursor on a timer. Without this the cursor is only ever
 	// read, and every restart would replay five minutes of history - which is
@@ -212,6 +290,54 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("streaming: %w", streamErr)
 	}
 	return nil
+}
+
+// upstreamReportEvery is how often upstream state is copied into the metrics.
+//
+// Short enough that a scrape cannot miss a disconnection, long enough that the
+// leadership check, which reads the KV lease, is not a hot loop.
+const upstreamReportEvery = 2 * time.Second
+
+// reportUpstream mirrors the client's live state into the metrics until ctx ends.
+//
+// Two things need this. The connected gauge and the leadership gauge are
+// point-in-time state that cannot be set once at startup, and the client's
+// counters are monotonic totals while the metrics want increments, so the delta
+// since the previous poll is what gets added.
+func reportUpstream(
+	ctx context.Context,
+	client *upstream.Client,
+	lock *elect.Lock,
+	metrics *obs.Metrics,
+) {
+	ticker := time.NewTicker(upstreamReportEvery)
+	defer ticker.Stop()
+
+	var prev struct{ malformed, rejected, reconnects int64 }
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		metrics.SetConnected(client.Connected())
+		metrics.SetLeader(lock == nil || lock.IsLeader())
+
+		if n := client.MalformedFrames(); n > prev.malformed {
+			metrics.ObserveMalformedFrames(n - prev.malformed)
+			prev.malformed = n
+		}
+		if n := client.RejectedStrokes(); n > prev.rejected {
+			metrics.ObserveRejectedStrokes(n - prev.rejected)
+			prev.rejected = n
+		}
+		if n := client.Reconnects(); n > prev.reconnects {
+			metrics.ObserveReconnect("upstream", "session_ended")
+			prev.reconnects = n
+		}
+	}
 }
 
 // process applies every stage to one stroke and publishes it.
@@ -254,13 +380,12 @@ func process(
 			logger.Warn("cannot place stroke", "stroke", s.Key(), "error", err)
 			return nil
 		}
-		if !geo.InCells(publisherCells(publisher), cell) {
+		if !publisher.AllowsCell(cell) {
 			metrics.DroppedTotal.WithLabelValues("outside_region").Inc()
 			return nil
 		}
 
-		dist, band := cfg.Region.ClassifyPoint(s.Lat, s.Lon, deviationOf(s))
-		_ = dist
+		_, band := cfg.Region.ClassifyPoint(s.Lat, s.Lon, deviationOf(s))
 		certainty = band
 		inside = band == geo.CertaintyIn || (band == geo.CertaintyBoundary && cfg.BoundaryPolicy == geo.PolicyInclude)
 		if !inside {
@@ -268,7 +393,16 @@ func process(
 			return nil
 		}
 	} else {
-		cell, _ = geo.Encode(s.Lat, s.Lon, feed.CellPrecision)
+		// World-wide: still record a cell, because the archive's spatial index
+		// and any later radius query both need one. A failure here is counted
+		// rather than swallowed, but it does not drop the stroke: with no region
+		// configured there is nothing to be outside of.
+		var err error
+		cell, err = geo.Encode(s.Lat, s.Lon, feed.CellPrecision)
+		if err != nil {
+			metrics.DroppedTotal.WithLabelValues("bad_coordinate").Inc()
+			logger.Warn("cannot place stroke; publishing without an archive cell", "stroke", s.Key(), "error", err)
+		}
 	}
 
 	// Stage 4: archive. The store's unique constraint makes a repeat a no-op,
@@ -280,8 +414,15 @@ func process(
 		logger.Error("archiving stroke", "stroke", s.Key(), "error", err)
 	}
 
-	// Stage 5: publish.
-	if err := publisher.Publish(ctx, s); err != nil {
+	// Stage 5: publish, tolerating a brief broker hiccup.
+	//
+	// Previously a single failed publish propagated out as a sink error, ended
+	// the stream, and exited the process. That is the wrong response to a
+	// momentary JetStream hiccup: one dropped acknowledgement should not restart
+	// the bridge and reconnect to an upstream that throttles connections. A
+	// sustained outage still ends the process, because continuing would mean
+	// silently discarding every stroke.
+	if err := publishWithRetry(ctx, publisher, s, cfg.PublishAttempts, cfg.PublishBackoff); err != nil {
 		metrics.PublishedTotal.WithLabelValues("error").Inc()
 		return fmt.Errorf("publishing %s: %w", s.Key(), err)
 	}
@@ -290,16 +431,53 @@ func process(
 	return nil
 }
 
+// strokePublisher is the publishing surface process needs.
+//
+// It is an interface rather than *feed.Publisher so the retry policy around it
+// can be exercised against a scripted broker, without a live JetStream for every
+// combination of failure and attempt count.
+type strokePublisher interface {
+	Publish(ctx context.Context, s model.Stroke) error
+}
+
+// publishWithRetry publishes a stroke, retrying a bounded number of times.
+//
+// It retries only on failure, and gives up as soon as the context is done so a
+// shutdown is not delayed by a broker that is already gone.
+func publishWithRetry(
+	ctx context.Context,
+	publisher strokePublisher,
+	s model.Stroke,
+	attempts int,
+	backoff time.Duration,
+) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = publisher.Publish(ctx, s); err == nil {
+			return nil
+		}
+		if attempt == attempts {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return err
+}
+
 func deviationOf(s model.Stroke) float64 {
 	if s.DeviationM == nil {
 		return 0
 	}
 	return float64(*s.DeviationM)
-}
-
-// publisherCells exposes the publisher's cell restriction.
-func publisherCells(p *feed.Publisher) map[string]struct{} {
-	return feed.CellSet(p.Cells())
 }
 
 // startPruner deletes old strokes on a timer.

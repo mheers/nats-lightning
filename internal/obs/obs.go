@@ -12,6 +12,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -31,12 +33,17 @@ type Metrics struct {
 	UpstreamConnected  prometheus.Gauge
 	UpstreamReconnects *prometheus.CounterVec
 	UpstreamMalformed  prometheus.Counter
+	RejectedStrokes    prometheus.Counter
 
 	LeadershipHeld prometheus.Gauge
 
 	StoreRows    prometheus.GaugeFunc
 	StorePruned  prometheus.Counter
 	PublishLagMs prometheus.Histogram
+
+	// Region is the configured region name, carried as a label on an info
+	// gauge rather than on every series.
+	Region *prometheus.GaugeVec
 
 	region string
 }
@@ -81,7 +88,12 @@ func NewMetrics(region string) *Metrics {
 
 		UpstreamMalformed: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "lightningfeed_malformed_frames_total",
-			Help: "Upstream frames that failed to decode.",
+			Help: "Upstream frames that failed to decode entirely.",
+		}),
+
+		RejectedStrokes: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lightningfeed_rejected_strokes_total",
+			Help: "Strokes dropped from otherwise decodable frames because they could not be normalised.",
 		}),
 
 		LeadershipHeld: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -107,16 +119,24 @@ func NewMetrics(region string) *Metrics {
 	m.reg.MustRegister(
 		m.StrokesTotal, m.PublishedTotal, m.DroppedTotal,
 		m.UpstreamConnected, m.UpstreamReconnects, m.UpstreamMalformed,
-		m.LeadershipHeld, m.StorePruned, m.PublishLagMs,
+		m.RejectedStrokes, m.LeadershipHeld, m.StorePruned, m.PublishLagMs,
 	)
 	m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "lightningfeed_build_info",
 		Help: "Static build and configuration information.",
 	}, func() float64 { return 1 }))
-	reg.MustRegister(prometheus.NewGaugeVec(prometheus.GaugeOpts{
+
+	m.Region = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "lightningfeed_config_info",
 		Help: "Configured region.",
-	}, []string{"region"}))
+	}, []string{"region"})
+	m.reg.MustRegister(m.Region)
+
+	// A CounterVec exports nothing until a label combination is observed, so
+	// zero-initialising the series here is what makes the reconnect rate
+	// computable from the first scrape. Without it the denominator is absent
+	// until the first reconnect, and rate() over the interval reports nothing.
+	m.UpstreamReconnects.WithLabelValues("upstream", "session_ended")
 
 	return m
 }
@@ -140,6 +160,81 @@ func (m *Metrics) LastMessageAgeGauge(lastMessage func() time.Time, connected fu
 		}
 		return time.Since(last).Seconds()
 	})
+}
+
+// Register attaches the gauges that depend on collaborators the metrics package
+// does not own, and returns the receiver so it can be used inline.
+//
+// These cannot be built in NewMetrics because they close over the upstream
+// client and the store, which do not exist yet at that point. Building them
+// there and registering them here is what makes them appear in the exposition:
+// a prometheus.GaugeFunc that is constructed but never registered exports
+// nothing at all, silently.
+func (m *Metrics) Register(collectors ...prometheus.Collector) *Metrics {
+	for _, c := range collectors {
+		if c != nil {
+			m.reg.MustRegister(c)
+		}
+	}
+	return m
+}
+
+// SetConnected records whether an upstream socket is live.
+//
+// It is a gauge rather than a derived value so the value cannot drift from
+// reality by omission: the previous arrangement set it once at startup and
+// never again, so it read 0 permanently.
+func (m *Metrics) SetConnected(connected bool) {
+	if connected {
+		m.UpstreamConnected.Set(1)
+		return
+	}
+	m.UpstreamConnected.Set(0)
+}
+
+// SetLeader records whether this process holds the leadership lease.
+func (m *Metrics) SetLeader(leader bool) {
+	if leader {
+		m.LeadershipHeld.Set(1)
+		return
+	}
+	m.LeadershipHeld.Set(0)
+}
+
+// ObserveReconnect counts a reconnect, labelled by host and reason.
+//
+// The label set is fixed rather than free-form so a mislabelled call cannot
+// quietly invent a new time series per upstream URL variant.
+func (m *Metrics) ObserveReconnect(host, reason string) {
+	m.UpstreamReconnects.WithLabelValues(host, reason).Inc()
+}
+
+// ObserveMalformedFrames adds to the count of frames that failed to decode.
+func (m *Metrics) ObserveMalformedFrames(n int64) {
+	if n > 0 {
+		m.UpstreamMalformed.Add(float64(n))
+	}
+}
+
+// ObserveRejectedStrokes adds to the count of individual strokes dropped from
+// otherwise decodable frames.
+//
+// This is a separate series from the malformed-frame count on purpose. Frames
+// that will not decode suggest a transport or protocol problem; strokes that
+// will not normalise suggest bad data inside healthy batches, and an operator
+// responding to one should not go looking for the other.
+func (m *Metrics) ObserveRejectedStrokes(n int64) {
+	if n > 0 {
+		m.RejectedStrokes.Add(float64(n))
+	}
+}
+
+// SetRegionInfo labels the build-info gauge with the configured region.
+//
+// A GaugeVec with no observed label value exports no series, so this has to be
+// called for the region to appear at all.
+func (m *Metrics) SetRegionInfo(region string) {
+	m.Region.WithLabelValues(region).Set(1)
 }
 
 // disconnectedSentinel stands in for "no frame yet" or "not connected".
@@ -251,7 +346,8 @@ func (p Probe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Server runs the metrics and health endpoints.
 type Server struct {
-	srv *http.Server
+	srv  *http.Server
+	addr string
 }
 
 // StartServer serves metrics and health on separate paths, and shuts down when
@@ -260,22 +356,35 @@ type Server struct {
 // The two are mounted at distinct paths rather than one handler at "/": a probe
 // registered at the root shadows every other route on the mux, which silently
 // leaves the metrics unreachable while the endpoint still appears healthy.
+//
+// The listener is opened here rather than by ListenAndServe so that a bind
+// failure is returned to the caller instead of being logged from a goroutine
+// nobody watches. ListenAndServe reports a port of 0 back as the literal "0", so
+// asking the kernel to choose a port left Addr() unable to say where the server
+// actually ended up.
 func StartServer(ctx context.Context, addr string, metrics, health http.Handler) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics)
 	mux.Handle("/healthz", health)
 	mux.Handle("/", health)
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("obs: listening on %s: %w", addr, err)
+	}
+
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	s := &Server{srv: srv, addr: ln.Addr().String()}
+
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// Nothing useful to do here: the process's own liveness is exposed
-			// through the metrics it was serving.
+			// through the metrics it was serving, and a listener that is already
+			// bound cannot be rebound.
 			_ = err
 		}
 	}()
@@ -287,15 +396,18 @@ func StartServer(ctx context.Context, addr string, metrics, health http.Handler)
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	return &Server{srv: srv}, nil
+	return s, nil
 }
 
-// Addr returns the listen address.
+// Addr returns the address the server actually bound to.
+//
+// This is the resolved address, so a caller that asked for port 0 learns which
+// port the kernel chose rather than being told "0".
 func (s *Server) Addr() string {
-	if s.srv == nil {
+	if s == nil {
 		return ""
 	}
-	return s.srv.Addr
+	return s.addr
 }
 
 // Close stops the server.
