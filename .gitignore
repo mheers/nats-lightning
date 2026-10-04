@@ -1,0 +1,17 @@
+# build output
+/lightningfeed
+/bin/
+/dist/
+
+# local state
+*.db
+*.db-wal
+*.db-shm
+/data/
+/tmp/
+
+# test artefacts
+*.out
+*.test
+*.prof
+coverage*
