@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -66,6 +67,15 @@ type Lock struct {
 	kv    nats.KeyValue
 	opts  Options
 	owner string
+
+	mu           sync.Mutex
+	cachedLeader cacheEntry
+}
+
+// cacheEntry is a remembered leadership answer and when it was taken.
+type cacheEntry struct {
+	value bool
+	at    time.Time
 }
 
 // NewLock prepares a lock on the given bucket.
@@ -179,6 +189,12 @@ func (l *Lock) renew() error {
 	if _, err := l.kv.Update(l.opts.Key, []byte(l.opts.Owner), entry.Revision()); err != nil {
 		return fmt.Errorf("extending lease: %w", err)
 	}
+
+	// A successful renewal is proof of ownership, so the cache is refreshed here
+	// rather than being left to expire on its own.
+	l.mu.Lock()
+	l.cachedLeader = cacheEntry{value: true, at: time.Now()}
+	l.mu.Unlock()
 	return nil
 }
 
@@ -196,17 +212,40 @@ func (l *Lock) release() {
 		l.opts.Logger.Warn("could not release lease", "error", err)
 		return
 	}
+
+	l.mu.Lock()
+	l.cachedLeader = cacheEntry{value: false, at: time.Now()}
+	l.mu.Unlock()
+
 	l.opts.Logger.Info("released leadership", "key", l.opts.Key)
 }
 
 // IsLeader reports whether this process currently believes it holds the lease.
 // It is a check, not a guarantee, and is intended for diagnostics.
 func (l *Lock) IsLeader() bool {
+	// Cached, so a scrape cannot turn into a burst of KV reads.
+	//
+	// The lease is renewed on a ticker, and this is called on every health check
+	// and every metrics poll. Reading through to the broker each time would make
+	// the observability path a load generator against the very bucket that decides
+	// who owns the pipeline.
+	l.mu.Lock()
+	cached := l.cachedLeader
+	l.mu.Unlock()
+	if time.Since(cached.at) < l.opts.Renew {
+		return cached.value
+	}
+
 	entry, err := l.kv.Get(l.opts.Key)
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(entry.Value())) == l.opts.Owner
+	leader := strings.TrimSpace(string(entry.Value())) == l.opts.Owner
+
+	l.mu.Lock()
+	l.cachedLeader = cacheEntry{value: leader, at: time.Now()}
+	l.mu.Unlock()
+	return leader
 }
 
 type discard struct{}
