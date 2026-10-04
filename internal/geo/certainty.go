@@ -56,15 +56,36 @@ func ParseBoundaryPolicy(s string) (BoundaryPolicy, error) {
 	}
 }
 
+// MaxPlausibleDeviationM bounds how large a reported location uncertainty may be.
+//
+// The asymmetry is the point: a negative figure is clamped to zero here, and an
+// enormous one was not bounded at all. DeviationM is an *int, so INT_MAX — the
+// most common "no data" sentinel in this family of protocols — is representable,
+// and every stroke within radius + dev then classifies as CertaintyBoundary. The
+// default PolicyInclude accepts boundary, so one stroke carrying a sentinel makes
+// every stroke on earth publish: the region filter stops filtering, no counter
+// moves, and /healthz still reports the region as configured.
+//
+// The observed range is 300–15000 m, so 100 km is two orders of magnitude of
+// headroom over anything the upstream has actually sent. The bound belongs here
+// rather than only at the decoder because this function is the last thing every
+// caller passes through, and a caller reading the archive or a future transport
+// must not be able to bypass it.
+const MaxPlausibleDeviationM = 100_000
+
 // Classify determines a stroke's band from its distance from the centre and the
 // upstream's reported deviation in metres.
 //
-// A negative deviation is treated as zero: an unusable uncertainty figure must
-// not manufacture ambiguity that the data does not support.
+// A negative deviation is treated as zero and one above
+// MaxPlausibleDeviationM is capped at it: an unusable uncertainty figure must not
+// manufacture ambiguity that the data does not support, in either direction.
 func (c Circle) Classify(distKm float64, deviationM float64) Certainty {
 	devKm := deviationM / 1000
-	if devKm < 0 {
+	switch {
+	case devKm < 0:
 		devKm = 0
+	case devKm > MaxPlausibleDeviationM/1000:
+		devKm = MaxPlausibleDeviationM / 1000
 	}
 	switch {
 	case distKm+devKm <= c.RadiusKm:

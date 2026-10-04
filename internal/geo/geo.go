@@ -186,6 +186,20 @@ type Circle struct {
 }
 
 // Validate reports whether the circle is usable.
+// MaxRadiusKm bounds a region so it stays a region.
+//
+// Cell enumeration is O(area) and the result is held in memory, held again as JSON
+// in the region table, and re-parsed by json_each on every radius query. Measured
+// at precision 5: 1000 km needs 251k cells and 15 MiB, 10000 km needs 18.3M cells
+// and 950 MiB, and 20000 km is the entire world at 33.5M. Nothing bounded the flag,
+// so one plausible-looking typo was a heap exhaustion.
+//
+// 2500 km is the project's own stated envelope — the store's sizing comment already
+// reasons about "a 2500 km radius needing millions of geohash-5 cells" and accepts
+// it — and it is a continent rather than a typo's worth of intent. Anyone who really
+// wants a hemisphere should run world-wide, which needs no cell list at all.
+const MaxRadiusKm = 2500
+
 func (c Circle) Validate() error {
 	if c.Lat < -90 || c.Lat > 90 {
 		return fmt.Errorf("geo: circle latitude %v out of range [-90, 90]", c.Lat)
@@ -196,25 +210,85 @@ func (c Circle) Validate() error {
 	if c.RadiusKm <= 0 {
 		return fmt.Errorf("geo: circle radius %v must be positive", c.RadiusKm)
 	}
+	if c.RadiusKm > MaxRadiusKm {
+		return fmt.Errorf(
+			"geo: circle radius %v km exceeds the %v km maximum; cell enumeration is "+
+				"O(area) and a hemisphere would exhaust memory. Omit the region "+
+				"entirely to publish world-wide",
+			c.RadiusKm, MaxRadiusKm)
+	}
 	return nil
+}
+
+// BoundingBoxes returns boxes whose union covers the circle.
+//
+// It is almost always one box, but a circle centred near longitude ±180 is two:
+// its longitude span runs off one edge of the coordinate space and reappears at the
+// other. Clamping the span instead — the obvious thing — silently drops the half of
+// the region on the far side, and because cell enumeration is a superset by design
+// everywhere else, that is the one place where erring generous quietly inverts into
+// erring lossy. A 200 km circle at longitude 179.5 enumerated 4565 cells and lost
+// 28% of its own area; every stroke there was dropped as "outside the region" and
+// invisible to the radius query, while the metric blamed the region for it.
+//
+// The longitude half-width widens toward the poles because meridians converge
+// there, and the cosine is floored so the result stays finite at the poles.
+func (c Circle) BoundingBoxes() []Bounds {
+	dLat := c.RadiusKm / kmPerDegLat
+	minLat := math.Max(-90, c.Lat-dLat)
+	maxLat := math.Min(90, c.Lat+dLat)
+
+	// The longitude half-width is set by the narrowest degree of longitude in the
+	// span, which is the one furthest from the equator — not the one at the centre.
+	// Measuring at the centre under-covers the poleward side of the circle, because a
+	// degree of longitude there covers fewer kilometres and so more degrees are needed
+	// to span the same distance. A 500 km circle at 70°N lost 6 cells' worth of its
+	// own area this way, which is the same failure as the seam below: a stroke inside
+	// the region, filed in a cell the region does not list, dropped as
+	// outside_region.
+	widest := math.Max(math.Abs(minLat), math.Abs(maxLat))
+	dLon := c.RadiusKm / cosLatKm(widest)
+
+	// The longitude span before clamping, in (-360, 360).
+	minLon, maxLon := c.Lon-dLon, c.Lon+dLon
+
+	switch {
+	case minLon < -180:
+		// Runs off the western edge and wraps to the east.
+		return []Bounds{
+			{MinLat: minLat, MaxLat: maxLat, MinLon: minLon + 360, MaxLon: 180},
+			{MinLat: minLat, MaxLat: maxLat, MinLon: -180, MaxLon: maxLon},
+		}
+	case maxLon > 180:
+		// Runs off the eastern edge and wraps to the west.
+		return []Bounds{
+			{MinLat: minLat, MaxLat: maxLat, MinLon: minLon, MaxLon: 180},
+			{MinLat: minLat, MaxLat: maxLat, MinLon: -180, MaxLon: maxLon - 360},
+		}
+	default:
+		return []Bounds{{MinLat: minLat, MaxLat: maxLat, MinLon: minLon, MaxLon: maxLon}}
+	}
 }
 
 // BoundingBox returns the smallest axis-aligned box containing the circle.
 //
 // This is what gets sent upstream as the viewport hint, so it must contain the
-// whole circle; a box that clipped it would silently drop strokes.
+// whole circle; a box that clipped it would silently drop strokes. It is the
+// un-wrapped form, which is what a viewport wants: a subscriber selecting across
+// the seam is one contiguous request, not two.
 //
-// The longitude half-width widens toward the poles because meridians converge
-// there. The cosine is floored so the result stays finite at the poles instead
-// of dividing by zero.
+// Use BoundingBoxes when enumerating cells, where the wrap has to be honoured.
 func (c Circle) BoundingBox() Bounds {
 	dLat := c.RadiusKm / kmPerDegLat
-	dLon := c.RadiusKm / cosLatKm(c.Lat)
+	minLat := math.Max(-90, c.Lat-dLat)
+	maxLat := math.Min(90, c.Lat+dLat)
+	widest := math.Max(math.Abs(minLat), math.Abs(maxLat))
+	dLon := c.RadiusKm / cosLatKm(widest)
 
 	return Bounds{
-		MinLat: math.Max(-90, c.Lat-dLat),
+		MinLat: minLat,
 		MinLon: math.Max(-180, c.Lon-dLon),
-		MaxLat: math.Min(90, c.Lat+dLat),
+		MaxLat: maxLat,
 		MaxLon: math.Min(180, c.Lon+dLon),
 	}
 }
@@ -247,6 +321,11 @@ func cosLatKm(lat float64) float64 {
 // The geohash tree is walked from the single root cell, pruning any subtree
 // whose box misses the target, so cost scales with the number of cells returned
 // rather than with the size of the world.
+//
+// A circle crossing the antimeridian has two target boxes rather than one, and the
+// walks are unioned: the boxes are disjoint, but a cell is only ever appended once
+// so the result is still a set. The order is unspecified because callers treat it as
+// a set — publisher.AllowsCell and the store's IN clause both do.
 func (c Circle) Cells(precision int) ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -255,12 +334,15 @@ func (c Circle) Cells(precision int) ([]string, error) {
 		return nil, fmt.Errorf("geo: precision %d out of range 1..12", precision)
 	}
 
-	target := c.BoundingBox()
-	if err := target.Validate(); err != nil {
-		return nil, err
+	targets := c.BoundingBoxes()
+	for _, t := range targets {
+		if err := t.Validate(); err != nil {
+			return nil, err
+		}
 	}
 
 	var out []string
+	seen := make(map[string]struct{})
 
 	// The walk starts at the geohash root, which is the whole world. Handing
 	// the empty string to CellBounds would be rejected as invalid, so the root
@@ -268,31 +350,36 @@ func (c Circle) Cells(precision int) ([]string, error) {
 	const rootCell = ""
 	rootBounds := Bounds{MinLat: -90, MinLon: -180, MaxLat: 90, MaxLon: 180}
 
-	var walk func(cell string, b Bounds) error
-	walk = func(cell string, b Bounds) error {
-		// No overlap with the target box: prune this entire subtree.
-		if b.MaxLon < target.MinLon || b.MinLon > target.MaxLon ||
-			b.MaxLat < target.MinLat || b.MinLat > target.MaxLat {
+	for _, target := range targets {
+		var walk func(cell string, b Bounds) error
+		walk = func(cell string, b Bounds) error {
+			// No overlap with the target box: prune this entire subtree.
+			if b.MaxLon < target.MinLon || b.MinLon > target.MaxLon ||
+				b.MaxLat < target.MinLat || b.MinLat > target.MaxLat {
+				return nil
+			}
+			if len(cell) == precision {
+				if _, dup := seen[cell]; !dup {
+					seen[cell] = struct{}{}
+					out = append(out, cell)
+				}
+				return nil
+			}
+			for i := range len(alphabet) {
+				child := cell + alphabet[i:i+1]
+				childBounds, err := CellBounds(child)
+				if err != nil {
+					return err
+				}
+				if err := walk(child, childBounds); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
-		if len(cell) == precision {
-			out = append(out, cell)
-			return nil
+		if err := walk(rootCell, rootBounds); err != nil {
+			return nil, err
 		}
-		for i := range len(alphabet) {
-			child := cell + alphabet[i:i+1]
-			childBounds, err := CellBounds(child)
-			if err != nil {
-				return err
-			}
-			if err := walk(child, childBounds); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := walk(rootCell, rootBounds); err != nil {
-		return nil, err
 	}
 	return out, nil
 }
