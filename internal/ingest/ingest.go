@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -27,10 +29,6 @@ import (
 	"github.com/heers-it/lightningfeed/internal/upstream"
 )
 
-// feedSubjectPrefix mirrors feed.SubjectPrefix for printing subjects without
-// importing the whole publisher.
-const feedSubjectPrefix = feed.SubjectPrefix
-
 // Runner is a handle to a running pipeline.
 //
 // It exists so the resolved address of the metrics server can reach the caller.
@@ -45,6 +43,35 @@ type Runner struct {
 	// Metrics is the metric set, for callers that want to read it directly rather
 	// than scrape the exposition.
 	Metrics *obs.Metrics
+}
+
+// storeHealth tracks whether the database is answering.
+//
+// It exists because nothing else in the process reports the archive's condition.
+// A failed Record is counted and logged and then deliberately tolerated, so that a
+// broken archive costs a missed query rather than a lost stroke — which is the right
+// trade, and also means a store that has been failing for an hour is invisible to
+// every signal except one counter nobody is watching. A readiness probe wired to a
+// local variable that is assigned once and never reassigned answers "healthy" about
+// a disk that has been full since startup.
+//
+// The last outcome wins, so a single failure reports unhealthy until the next
+// successful operation clears it. That is deliberate: the alternative is a probe
+// that is slow to admit a problem, which for a readiness endpoint is worse than one
+// that is quick to clear.
+type storeHealth struct{ v atomic.Bool }
+
+func newStoreHealth() *storeHealth {
+	h := &storeHealth{}
+	h.v.Store(true)
+	return h
+}
+
+func (h *storeHealth) ok() bool { return h.v.Load() }
+
+// observe records the outcome of a store operation.
+func (h *storeHealth) observe(err error) {
+	h.v.Store(err == nil)
 }
 
 // Run executes the bridge until ctx ends.
@@ -187,7 +214,7 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 	metrics.SetConnected(false)
 	metrics.SetLeader(lock != nil)
 
-	storeHealthy := true
+	storeHealth := newStoreHealth()
 
 	filter := dedup.New(dedup.Options{
 		ReconnectWindow: cfg.BackfillDrop,
@@ -225,7 +252,7 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 		Connected:    client.Connected,
 		LastMessage:  client.LastMessage,
 		IsLeader:     func() bool { return lock == nil || lock.IsLeader() },
-		StoreHealthy: func() bool { return storeHealthy },
+		StoreHealthy: storeHealth.ok,
 		Version:      "dev",
 		Region:       cfg.RegionName,
 		ID:           hostID(),
@@ -251,14 +278,27 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 	// two upstream connections.
 	leaderCtx, stopLeader := context.WithCancel(ctx)
 	defer stopLeader()
+
+	// The lease failure has to be carried out of the goroutine that watches it.
+	//
+	// Cancelling the pipeline is the only lever that watcher has, and a cancelled
+	// pipeline makes client.Run return context.Canceled. Mapping that to a nil
+	// error reported a lost lease as a clean shutdown: the process exited 0, so a
+	// supervisor's Restart=on-failure brought nothing back and the bridge had
+	// quietly stopped feeding data while every exit signal said otherwise.
+	var leaderFailure leadershipFailure
+
 	if lock != nil {
 		go func() {
-			if err := lock.Run(leaderCtx); err != nil && leaderCtx.Err() == nil {
-				logger.Error("leadership lost, shutting down", "error", err)
-				// Cancelling the outer context is the only way to stop Run, and
-				// stopping is the correct response to losing the lease.
-				stopLeader()
+			err := lock.Run(leaderCtx)
+			// A cancelled context means we asked for this, so it is a shutdown
+			// rather than a loss.
+			if leaderCtx.Err() != nil || err == nil {
+				return
 			}
+			logger.Error("leadership lost, shutting down", "error", err)
+			leaderFailure.set(err)
+			stopLeader()
 		}()
 	}
 
@@ -274,20 +314,59 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 	// precisely what loading it at startup was meant to avoid.
 	cursorDone := startCursorSaver(leaderCtx, db, client, cfg.UpstreamURL, cfg, logger)
 
-	pruneDone := startPruner(leaderCtx, db, cfg, logger, metrics)
+	pruneDone := startPruner(leaderCtx, db, cfg, logger, metrics, storeHealth)
 
 	streamErr := client.Run(leaderCtx, func(ctx context.Context, s model.Stroke) error {
-		return process(ctx, s, filter, publisher, db, cfg, metrics, logger)
+		return process(ctx, s, filter, publisher, db, cfg, metrics, storeHealth, logger)
 	})
 	stopLeader()
 	<-pruneDone
 	<-cursorDone
 
-	if errors.Is(streamErr, elect.ErrNotLeader) {
-		return streamErr
-	}
+	return streamOutcome(streamErr, leaderFailure.get())
+}
+
+// leadershipFailure carries a lost lease out of the goroutine that watches it.
+//
+// It is a type rather than a bare variable so the access is obviously synchronised
+// rather than relying on the reader noticing.
+type leadershipFailure struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (f *leadershipFailure) set(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *leadershipFailure) get() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
+}
+
+// streamOutcome decides what the pipeline reports once streaming has stopped.
+//
+// The leadership error is a separate argument because losing the lease ends the
+// pipeline by cancelling it: client.Run then reports context.Canceled, which says
+// nothing about why. Treating that cancellation as success made the process exit 0
+// after another process had taken over as the single upstream connection, so a
+// supervisor that only restarts on failure brought nothing back while every exit
+// signal said the shutdown had been deliberate.
+func streamOutcome(streamErr, leadershipErr error) error {
+	// A real streaming failure is the most specific explanation available, so it
+	// wins over a cancellation that merely followed from it.
 	if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 		return fmt.Errorf("streaming: %w", streamErr)
+	}
+
+	// Losing the lease must be a non-nil error. It is the one case where "nothing
+	// went wrong" and "somebody else is now the writer" look identical from the
+	// outside, and only one of them is true.
+	if leadershipErr != nil {
+		return fmt.Errorf("leadership lost: %w", leadershipErr)
 	}
 	return nil
 }
@@ -352,6 +431,7 @@ func process(
 	db *store.Store,
 	cfg *config.Config,
 	metrics *obs.Metrics,
+	storeHealth *storeHealth,
 	logger *slog.Logger,
 ) error {
 	metrics.StrokesTotal.WithLabelValues(fmt.Sprintf("%d", int(s.Src))).Inc()
@@ -410,8 +490,11 @@ func process(
 	if err := db.Record(ctx, s, cell, certainty); err != nil {
 		// A store failure must not lose the stroke: carry on and publish, and
 		// let the metric show the archive falling behind.
+		storeHealth.observe(err)
 		metrics.DroppedTotal.WithLabelValues("store_error").Inc()
 		logger.Error("archiving stroke", "stroke", s.Key(), "error", err)
+	} else {
+		storeHealth.observe(nil)
 	}
 
 	// Stage 5: publish, tolerating a brief broker hiccup.
@@ -487,6 +570,7 @@ func startPruner(
 	cfg *config.Config,
 	logger *slog.Logger,
 	metrics *obs.Metrics,
+	storeHealth *storeHealth,
 ) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
@@ -498,6 +582,7 @@ func startPruner(
 			cutoff := time.Now().Add(-cfg.Retention)
 			n, err := db.Prune(ctx, cutoff)
 			if err != nil {
+				storeHealth.observe(err)
 				logger.Error("pruning strokes", "error", err)
 				return
 			}
@@ -505,6 +590,9 @@ func startPruner(
 				metrics.StorePruned.Add(float64(n))
 				logger.Info("pruned old strokes", "removed", n, "retention", cfg.Retention)
 			}
+			// A pruning failure matters less than a write failure — the archive only
+			// grows — so it is not allowed to retract the verdict Prune just gave,
+			// which is why its error is logged but not observed.
 			if _, err := db.PruneCursors(ctx, cutoff); err != nil {
 				logger.Warn("pruning cursors", "error", err)
 			}
