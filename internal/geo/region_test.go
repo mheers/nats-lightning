@@ -2,6 +2,7 @@ package geo
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -119,6 +120,123 @@ func TestBoundingBoxStaysContiguousForTheViewport(t *testing.T) {
 	normal := Circle{Lat: 35.3340688, Lon: 24.4944483, RadiusKm: 10}
 	if got := len(normal.BoundingBoxes()); got != 1 {
 		t.Errorf("BoundingBoxes returned %d boxes for an ordinary region, want 1", got)
+	}
+}
+
+// A circle at a pole spans an enormous number of degrees of longitude, because the
+// cosine that converts kilometres to degrees of longitude is floored rather than
+// allowed to divide by zero. A 10 km circle at latitude 90 works out to about 9e7
+// degrees, which is many times the globe.
+//
+// Wrapping that is meaningless, and the arithmetic produced boxes reaching past
+// ±180, so Cells rejected the output of a circle Validate had just accepted. The
+// contract that a circle passing Validate can be enumerated is what callers rely on,
+// so it is asserted directly rather than left to the fuzzer that found it.
+func TestCellsHandleCirclesThatSpanTheGlobe(t *testing.T) {
+	cases := []Circle{
+		{Lat: 90.0, Lon: 180.0, RadiusKm: 10},
+		{Lat: -90.0, Lon: -180.0, RadiusKm: 10},
+		{Lat: 90.0, Lon: 0.0, RadiusKm: 10},
+		{Lat: -90.0, Lon: 45.0, RadiusKm: 10},
+		{Lat: 89.9999999, Lon: 179.0, RadiusKm: 10},
+		// Just under the threshold where the span still wraps rather than saturates.
+		{Lat: 89.0, Lon: 0.0, RadiusKm: 200},
+	}
+
+	for _, c := range cases {
+		t.Run(describeCircle(c), func(t *testing.T) {
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate rejected the circle, so the case is not testing what it claims: %v", err)
+			}
+
+			boxes := c.BoundingBoxes()
+			for i, b := range boxes {
+				if err := b.Validate(); err != nil {
+					t.Errorf("box %d of %d is outside the coordinate space: %+v (%v)", i, len(boxes), b, err)
+				}
+			}
+
+			cells, err := c.Cells(5)
+			if err != nil {
+				t.Fatalf("Cells failed on a circle Validate accepted: %v", err)
+			}
+			if len(cells) == 0 {
+				t.Error("Cells returned nothing for a valid circle")
+			}
+
+			// Whatever the boxes decided, the centre must be covered.
+			centre, err := Encode(c.Lat, c.Lon, 5)
+			if err == nil {
+				found := false
+				for _, cell := range cells {
+					if cell == centre {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("cell %q containing the centre is not among the %d returned", centre, len(cells))
+				}
+			}
+		})
+	}
+}
+
+// MaxCells is enforced in Cells rather than in Validate, because the cell count is
+// the quantity that matters and the radius does not predict it: a 2500 km region is
+// 1.1 M cells at the equator and 8.0 M at latitude 60, for the same flag value.
+//
+// This asserts both halves of that. The expensive regions must be refused, and the
+// cheap ones must not be — including the polar circles, whose longitude span is the
+// entire globe while their cell count is in the thousands. A cheaper proxy for the
+// bound (the one this replaced) rejected those.
+func TestTheCellBudgetRefusesOnlyExpensiveRegions(t *testing.T) {
+	refused := []Circle{
+		{Lat: 60, Lon: 0, RadiusKm: 2500},      // 8.0 M cells, 1523 MiB
+		{Lat: 75, Lon: -179.5, RadiusKm: 1800}, // 5.8 M cells, 962 MiB
+		{Lat: 70, Lon: 0, RadiusKm: 2000},      // 6.7 M cells, 1095 MiB
+		{Lat: 45, Lon: 0, RadiusKm: 2500},      // 2.7 M cells, 486 MiB
+	}
+	for _, c := range refused {
+		t.Run("refused/"+describeCircle(c), func(t *testing.T) {
+			cells, err := c.Cells(5)
+			if err == nil {
+				t.Fatalf("Cells accepted %+v and returned %d cells", c, len(cells))
+			}
+			if len(cells) != 0 {
+				t.Errorf("Cells returned %d cells alongside its error", len(cells))
+			}
+			if !strings.Contains(err.Error(), "geohash") {
+				t.Errorf("error does not explain the cost: %v", err)
+			}
+		})
+	}
+
+	accepted := []Circle{
+		{Lat: 0, Lon: 0, RadiusKm: 2500}, // 1.1 M cells
+		{Lat: 35.3340688, Lon: 24.4944483, RadiusKm: 10},
+		{Lat: 60, Lon: 0, RadiusKm: 1000}, // 467k cells
+		// The polar cases a span-based bound wrongly refused.
+		{Lat: 90, Lon: 180, RadiusKm: 1}, // 8k cells
+		{Lat: -90, Lon: -180, RadiusKm: 1},
+		{Lat: 90, Lon: 0, RadiusKm: 10}, // 25k cells
+	}
+	for _, c := range accepted {
+		t.Run("accepted/"+describeCircle(c), func(t *testing.T) {
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate rejected the circle: %v", err)
+			}
+			cells, err := c.Cells(5)
+			if err != nil {
+				t.Fatalf("Cells refused an affordable region: %v", err)
+			}
+			if len(cells) == 0 {
+				t.Error("Cells returned nothing")
+			}
+			if len(cells) > MaxCells {
+				t.Errorf("Cells returned %d cells, over the budget", len(cells))
+			}
+		})
 	}
 }
 

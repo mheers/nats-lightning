@@ -3,6 +3,7 @@
 package geo
 
 import (
+	"errors"
 	"fmt"
 	"math"
 )
@@ -188,18 +189,42 @@ type Circle struct {
 // Validate reports whether the circle is usable.
 // MaxRadiusKm bounds a region so it stays a region.
 //
-// Cell enumeration is O(area) and the result is held in memory, held again as JSON
-// in the region table, and re-parsed by json_each on every radius query. Measured
-// at precision 5: 1000 km needs 251k cells and 15 MiB, 10000 km needs 18.3M cells
-// and 950 MiB, and 20000 km is the entire world at 33.5M. Nothing bounded the flag,
-// so one plausible-looking typo was a heap exhaustion.
+// This is a cheap sanity bound, and it is deliberately not the memory bound: a
+// degree of longitude covers fewer kilometres the further you get from the equator,
+// so the same radius needs progressively more cells. Measured at precision 5, for a
+// 2500 km radius, the latitude column matters more than anything an operator types:
 //
-// 2500 km is the project's own stated envelope — the store's sizing comment already
-// reasons about "a 2500 km radius needing millions of geohash-5 cells" and accepts
-// it — and it is a continent rather than a typo's worth of intent. Anyone who really
-// wants a hemisphere should run world-wide, which needs no cell list at all.
+//	latitude   cells      heap
+//	     0°    1.1 M     218 MiB
+//	    30°    1.7 M     249 MiB
+//	    45°    2.7 M     486 MiB
+//	    60°    8.0 M   1523 MiB
+//	    70°    7.9 M   1522 MiB
+//
+// So the cost is bounded where it is actually incurred — see MaxCells — rather than
+// here.
 const MaxRadiusKm = 2500
 
+// MaxCells bounds what enumerating a region's cells may cost.
+//
+// It is enforced inside Cells rather than in Validate because the cell count is the
+// quantity that matters and it is not predictable from the radius alone. Bounding a
+// proxy instead is what this constant replaced, and the proxy was wrong in both
+// directions: it rejected a 1 km circle at the pole, which is one of the cheapest
+// regions there is — all longitudes meet at the pole, so its longitude span is the
+// whole globe while its cells number in the thousands — and it was the only thing
+// standing between a Scandinavian 2500 km region and a 1.5 GiB allocation.
+//
+// The result is paid three times over: the cell list is built in memory, written to
+// the region table as JSON, and re-parsed by json_each on every radius query. Two
+// million cells is about a quarter of a gigabyte, which is the most this process has
+// ever needed.
+const MaxCells = 2_000_000
+
+// Validate checks a circle is usable as a region.
+//
+// Only geometry is checked here. Whether the enumeration is affordable is decided by
+// Cells, which is the only place that can know.
 func (c Circle) Validate() error {
 	if c.Lat < -90 || c.Lat > 90 {
 		return fmt.Errorf("geo: circle latitude %v out of range [-90, 90]", c.Lat)
@@ -212,8 +237,7 @@ func (c Circle) Validate() error {
 	}
 	if c.RadiusKm > MaxRadiusKm {
 		return fmt.Errorf(
-			"geo: circle radius %v km exceeds the %v km maximum; cell enumeration is "+
-				"O(area) and a hemisphere would exhaust memory. Omit the region "+
+			"geo: circle radius %v km exceeds the %v km maximum. Omit the region "+
 				"entirely to publish world-wide",
 			c.RadiusKm, MaxRadiusKm)
 	}
@@ -249,7 +273,18 @@ func (c Circle) BoundingBoxes() []Bounds {
 	widest := math.Max(math.Abs(minLat), math.Abs(maxLat))
 	dLon := c.RadiusKm / cosLatKm(widest)
 
-	// The longitude span before clamping, in (-360, 360).
+	// Near a pole the cosine floor makes dLon enormous: a 10 km circle at latitude
+	// 90 spans about 9e7 degrees of longitude, which is many times the whole globe.
+	// Wrapping that is meaningless — there is nothing left outside it — and
+	// arithmetic on it produced boxes reaching past ±180, so Cells rejected the
+	// output of a circle that Validate had just accepted. Once the span covers the
+	// world the answer is simply the world.
+	if dLon >= 180 {
+		return []Bounds{{MinLat: minLat, MaxLat: maxLat, MinLon: -180, MaxLon: 180}}
+	}
+
+	// With dLon < 180 the span is under 360 degrees, so it can cross at most one
+	// edge and both resulting boxes land inside [-180, 180].
 	minLon, maxLon := c.Lon-dLon, c.Lon+dLon
 
 	switch {
@@ -360,6 +395,13 @@ func (c Circle) Cells(precision int) ([]string, error) {
 			}
 			if len(cell) == precision {
 				if _, dup := seen[cell]; !dup {
+					// Budget checked before the append, so the walk never allocates
+					// more than MaxCells however large the region is. The tree is
+					// pruned above, so an over-budget region costs the walk and then
+					// stops, rather than the allocation it was heading for.
+					if len(out) >= MaxCells {
+						return errTooManyCells
+					}
 					seen[cell] = struct{}{}
 					out = append(out, cell)
 				}
@@ -378,11 +420,22 @@ func (c Circle) Cells(precision int) ([]string, error) {
 			return nil
 		}
 		if err := walk(rootCell, rootBounds); err != nil {
+			if errors.Is(err, errTooManyCells) {
+				return nil, fmt.Errorf(
+					"geo: a region of %.4f,%.4f with radius %v km needs more than %d "+
+						"geohash-%d cells, which is more than this bridge will allocate. "+
+						"Use a smaller radius, or omit the region to publish world-wide",
+					c.Lat, c.Lon, c.RadiusKm, MaxCells, precision)
+			}
 			return nil, err
 		}
 	}
 	return out, nil
 }
+
+// errTooManyCells aborts the cell walk when a region exceeds MaxCells. It is
+// distinguished from other walk errors only so the caller can explain the cost.
+var errTooManyCells = errors.New("geo: region exceeds the cell budget")
 
 // InCells reports whether a geohash is in the set. An empty set means no
 // restriction, which is how a world-wide deployment runs.
