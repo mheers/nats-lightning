@@ -7,11 +7,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -26,7 +29,20 @@ import (
 var version = "dev"
 
 func main() {
-	if err := newRoot().Execute(); err != nil {
+	// SIGTERM and SIGINT cancel the context rather than killing the process, which
+	// is the whole difference between a stop and a crash.
+	//
+	// Without this the default disposition applies and the process dies on the
+	// signal: the upstream socket is torn down by the kernel rather than closed, the
+	// resume cursor is never written again, and the leadership lease is left to expire
+	// on its TTL — so a standby waits out the remaining lease on every rolling deploy.
+	// The systemd unit documents that this releases the lease for an immediate
+	// handover, and TimeoutStopSec only buys the process time to do something it
+	// otherwise never attempts.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := newRoot().ExecuteContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "lightningfeed: %v\n", err)
 		os.Exit(1)
 	}

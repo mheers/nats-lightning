@@ -619,11 +619,25 @@ func startPruner(
 	return done
 }
 
-// cursorSaveEvery is how often the resume cursor is written.
+// cursorSaveEvery is how often the resume cursor is written once there is one to
+// write.
 //
-// Short enough that an unclean restart replays very little, long enough that
-// writing is not measurable against a stream of a few strokes per second.
+// Short enough that an unclean restart replays very little, long enough that writing
+// is not measurable against a stream of a few strokes per second.
 const cursorSaveEvery = 30 * time.Second
+
+// cursorSaveFirst is the first, deliberately impatient, save attempt.
+//
+// It exists because a fixed interval has a blind spot at the start of a process, and
+// that is the wrong end to be blind at. Saving on a timer alone means a process that
+// died within the first interval left no cursor behind, which is exactly the window a
+// comment here once claimed to cover while doing nothing about it.
+//
+// Saving immediately is not the fix either: this goroutine starts before the upstream
+// connection is established, so at that instant no stroke has been seen and there is
+// nothing to save. So the interval starts short and backs off until a save has
+// actually landed.
+const cursorSaveFirst = time.Second
 
 // startCursorSaver persists the upstream resume cursor on a timer.
 //
@@ -643,20 +657,13 @@ func startCursorSaver(
 	go func() {
 		defer close(done)
 
-		ticker := time.NewTicker(cursorSaveEvery)
-		defer ticker.Stop()
-
-		// Write once straight away so a restart within the first interval still
-		// finds a cursor.
+		// save reports whether a cursor was actually written. An unwritten save is
+		// not a failure — there is simply nothing to record yet — but it does mean
+		// the process is still unprotected, so the next attempt comes sooner.
 		//
-		// This has to actually happen. The comment used to promise it while the
-		// first save waited for the first tick, so the first 30 seconds of every
-		// process wrote no cursor at all — which is exactly the window the comment
-		// said it was protecting. Combined with the guard below, a process that
-		// died inside that window found an empty cursor table and replayed the
-		// upstream's full five minutes: once per crash-loop and once per rolling
-		// deploy.
-		save := func() {
+		// The context is a parameter because the final save on shutdown cannot use
+		// the cancelled one: it would fail on the very call that matters most.
+		save := func(ctx context.Context) bool {
 			c := store.Cursor{Sources: map[model.Source]int64{}, Server: upstreamURL}
 			for _, src := range []model.Source{model.SourceBlitzortung, model.SourceLightningMaps} {
 				if id := client.LastSeen(src); id > 0 {
@@ -664,21 +671,41 @@ func startCursorSaver(
 				}
 			}
 			if len(c.Sources) == 0 {
-				return // nothing seen yet; do not overwrite a good cursor
+				return false // nothing seen yet; do not overwrite a good cursor
 			}
 			if err := db.SaveCursor(ctx, c); err != nil {
 				logger.Error("saving the resume cursor", "error", err)
+				return false
 			}
+			return true
 		}
 
-		save()
+		interval := cursorSaveFirst
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
+				// One last write, so a graceful stop does not give back the
+				// position accumulated since the last tick. Detached from the
+				// cancelled context and given a moment, because a save that fails
+				// on cancellation would leave the restart exactly where this stop
+				// found it.
+				flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				save(flushCtx)
+				cancel()
 				return
-			case <-ticker.C:
-				save()
+			case <-timer.C:
+				if save(ctx) {
+					interval = cursorSaveEvery
+				} else if interval < cursorSaveEvery {
+					interval *= 2
+					if interval > cursorSaveEvery {
+						interval = cursorSaveEvery
+					}
+				}
+				timer.Reset(interval)
 			}
 		}
 	}()
