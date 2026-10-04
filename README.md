@@ -98,10 +98,14 @@ turn a regional deployment into a global one.
 A region on the equator or the prime meridian is legitimate: a `0` is treated as
 supplied, not missing.
 
-**The radius is capped at 2500 km.** Cell enumeration is O(area) and its result is
-held in memory, written to the archive as JSON, and re-parsed on every radius query,
-so 10000 km is 18.3 million cells and roughly a gigabyte. If you want more than that,
-omit the region and publish world-wide, which needs no cell list at all.
+**The radius is capped at 2500 km, and the cell enumeration at 2 million cells.**
+Cell enumeration is O(area) and its result is held in memory, written to the
+archive as JSON, and re-parsed on every radius query. The radius cap alone is not
+enough, because a degree of longitude covers fewer kilometres the further you get
+from the equator — the *same* 2500 km radius is 1.1 M cells at the equator and
+8.0 M (1.5 GiB) at latitude 60. So the second bound is on the cell count, which is
+the thing that actually costs. If you want more than either allows, omit the region
+and publish world-wide, which needs no cell list at all.
 
 Regions that cross the antimeridian (Fiji, Kiribati, the Chatham Islands) are
 handled: the cell list wraps.
@@ -319,6 +323,12 @@ Alerts worth having: `upstream_last_message_age > 60s` for 5 min;
 go test ./...                       # unit and integration, no network
 go test -race ./...
 go test -tags e2e -timeout 5m ./internal/e2e/ -run TestLive -v   # against the live upstream
+
+# fuzzing. FuzzCircleCells needs -parallel: each worker allocates up to the cell
+# budget while probing it, so one worker per core exhausts memory.
+go test -run FuzzParseFrame -fuzz FuzzParseFrame -fuzztime=90s ./internal/upstream/
+go test -run FuzzStrokeCoordinate -fuzz FuzzStrokeCoordinate -fuzztime=90s ./internal/upstream/
+go test -run FuzzCircleCells -fuzz FuzzCircleCells -fuzztime=120s -parallel=4 ./internal/geo/
 ```
 
 The `e2e` tests are behind a build tag and excluded from `go test ./...`
