@@ -18,6 +18,7 @@ import (
 	"github.com/heers-it/lightningfeed/internal/config"
 	"github.com/heers-it/lightningfeed/internal/feed"
 	"github.com/heers-it/lightningfeed/internal/ingest"
+	"github.com/heers-it/lightningfeed/internal/model"
 	"github.com/heers-it/lightningfeed/internal/upstream"
 )
 
@@ -196,27 +197,62 @@ subjects, and printing them avoids reimplementing the cell enumeration.`),
 				return nil
 			}
 
-			// Resolve the source code the mask selects, so the printed subjects
-			// are the ones a consumer would actually subscribe to.
-			src := 0
-			for _, bit := range []upstream.SrcMask{
-				upstream.MaskReserved, upstream.MaskBlitzortung,
-				upstream.MaskLightningMaps, upstream.MaskTesting,
-			} {
-				if cfg.SourceMask&bit == 0 {
-					continue
-				}
-				if code, ok := bit.SrcForMask(); ok {
-					src = int(code)
-				}
-			}
+			// Every source the mask selects gets its own subjects, because the
+			// subject carries the source code and the two networks issue
+			// independent ids. Printing only one of them — as this did, by
+			// letting each matching bit overwrite the last — would hand a
+			// subscriber working with a multi-network mask an incomplete
+			// subscription list.
+			sources := selectedSources(cfg.SourceMask)
 
-			fmt.Fprintf(cmd.OutOrStdout(), "%s: %d cells, radius %.4g km around %.4f,%.4f\n\n",
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "%s: %d cells, radius %.4g km around %.4f,%.4f\n",
 				cfg.RegionName, len(cells), cfg.Region.RadiusKm, cfg.Region.Lat, cfg.Region.Lon)
-			for _, c := range cells {
-				fmt.Fprintf(cmd.OutOrStdout(), "%s.src.%d.cell.%s\n", feed.SubjectPrefix, src, c)
+
+			if len(sources) == 0 {
+				fmt.Fprintf(out, "\nno source carries data; the mask selects only networks "+
+					"observed to be empty\n")
+				return nil
+			}
+			fmt.Fprintf(out, "sources: %s\n", joinSources(sources))
+
+			for _, src := range sources {
+				fmt.Fprintf(out, "\n%s\n", model.Source(src).String())
+				for _, c := range cells {
+					fmt.Fprintf(out, "%s.src.%d.cell.%s\n", feed.SubjectPrefix, src, c)
+				}
 			}
 			return nil
 		},
 	}
+}
+
+// selectedSources returns the source codes a mask actually subscribes to.
+//
+// Bits that resolve to no source are skipped rather than reported, because the
+// reserved and testing networks were observed to carry no data at all. Returning
+// them would print subjects nothing is ever published to.
+func selectedSources(mask upstream.SrcMask) []int {
+	var out []int
+	for _, bit := range []upstream.SrcMask{
+		upstream.MaskReserved, upstream.MaskBlitzortung,
+		upstream.MaskLightningMaps, upstream.MaskTesting,
+	} {
+		if mask&bit == 0 {
+			continue
+		}
+		if code, ok := bit.SrcForMask(); ok {
+			out = append(out, int(code))
+		}
+	}
+	return out
+}
+
+// joinSources renders source codes for a one-line summary.
+func joinSources(sources []int) string {
+	parts := make([]string, 0, len(sources))
+	for _, s := range sources {
+		parts = append(parts, fmt.Sprintf("src.%d", s))
+	}
+	return strings.Join(parts, ", ")
 }
