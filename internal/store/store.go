@@ -298,11 +298,16 @@ func (s *Store) StrokesSince(ctx context.Context, since time.Time, limit int) ([
 		limit = maxRows
 	}
 
+	// The newest rows are selected first, because a LIMIT applied to an ascending
+	// scan keeps the *oldest* matching rows. Asking for the last ten strokes since
+	// yesterday returned the first ten of that window instead, which looks like a
+	// working query right up until someone notices the timestamps are hours stale.
+	// The result is reversed afterwards to restore the documented newest-last order.
 	const q = `
 SELECT src, stroke_id, time_ms, received_ms, lat, lon, deviation_m, delay_ms, cell, certainty
   FROM stroke
  WHERE time_ms >= ?
- ORDER BY time_ms
+ ORDER BY time_ms DESC
  LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, since.UnixMilli(), limit)
@@ -321,6 +326,11 @@ SELECT src, stroke_id, time_ms, received_ms, lat, lon, deviation_m, delay_ms, ce
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: reading rows: %w", err)
+	}
+
+	// Restore the documented newest-last order, which the DESC scan inverted.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
 }

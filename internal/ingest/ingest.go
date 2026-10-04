@@ -616,7 +616,14 @@ func PrintHistory(ctx context.Context, cfg *config.Config, since string, limit i
 		return err
 	}
 
-	if len(strokes) > limit {
+	// A limit of zero or less means "no limit", which is both what StrokesSince
+	// already assumes and what the CLI passes when --limit is omitted.
+	//
+	// Truncating unconditionally was the bug: an omitted --limit arrives as 0, so
+	// every documented invocation sliced the result down to strokes[len:], which is
+	// empty. The command reported "no strokes recorded" against an archive full of
+	// them, and a negative value sliced past the end of the slice and panicked.
+	if limit > 0 && len(strokes) > limit {
 		strokes = strokes[len(strokes)-limit:]
 	}
 
