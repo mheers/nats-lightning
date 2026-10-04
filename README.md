@@ -145,6 +145,10 @@ them would list subjects nothing is ever published to.
 `history` reads SQLite rather than NATS because a **radius query is not something
 subject filtering can express**.
 
+`--limit` bounds how many strokes are printed, keeping the **most recent** ones;
+omit it for everything in the window. A negative value is rejected rather than
+treated as unlimited.
+
 ### There is no upstream failover
 
 There is deliberately no failover URL, and `live2` is never dialled
@@ -166,6 +170,12 @@ the cost of a repointed `--upstream-url` is one window of backfill, not a
 pipeline that will not start. Republishing history as live data — the one failure
 this whole pipeline exists to prevent — cannot happen either way. If you want the
 second server, set `--upstream-url` to it deliberately and accept the cold start.
+
+Losing the lease to another process **stops the pipeline and exits non-zero**. It
+has to: the process can only stop itself by cancelling, and a cancelled pipeline
+looks identical to a deliberate shutdown. Exiting 0 would mean a supervisor's
+`Restart=on-failure` brought nothing back, and the bridge would have quietly
+stopped feeding data while every exit signal said otherwise.
 
 ## Consuming
 
@@ -247,6 +257,11 @@ the null island.
 - `GET :9109/metrics` — Prometheus
 - `GET :9109/healthz` — readiness. A standby reports **not ready** on purpose: it
   is working correctly and should not be sent traffic.
+
+Readiness also goes false when the **store stops answering**, and recovers on the
+next successful archive write. A failed archive write is otherwise deliberately
+tolerated — it costs a missed query rather than a lost stroke — so without this the
+probe would report a store that had been failing for an hour as healthy.
 
 | Metric | Watches |
 |---|---|
