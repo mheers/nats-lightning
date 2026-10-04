@@ -165,9 +165,18 @@ func extractHistoryFlags(args []string, since *string, limit *int) ([]string, er
 		case "--since":
 			*since = v
 		case "--limit":
-			if *limit, err = strconv.Atoi(v); err != nil {
+			n, err := strconv.Atoi(v)
+			if err != nil {
 				return nil, fmt.Errorf("--limit %q: %w", v, err)
 			}
+			// Zero means "no limit" and is what an omitted flag resolves to, but a
+			// negative number is a sign error rather than a request for everything.
+			// Treating it as unlimited would answer a typo with a hundred thousand
+			// rows of output, and treating it as zero would answer with none.
+			if n < 0 {
+				return nil, fmt.Errorf("--limit %d: must not be negative; omit it for no limit", n)
+			}
+			*limit = n
 		}
 	}
 	return rest, nil

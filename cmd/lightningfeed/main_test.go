@@ -297,6 +297,11 @@ func TestExtractHistoryFlagsErrors(t *testing.T) {
 		{"missing since value", []string{"--since"}, "needs a value"},
 		{"missing limit value", []string{"--limit"}, "needs a value"},
 		{"limit is not a number", []string{"--limit=many"}, "--limit"},
+		// A negative limit used to reach PrintHistory, which sliced
+		// strokes[len+1:] and panicked. Rejecting it here also stops a typo from
+		// being answered with the entire archive.
+		{"negative limit", []string{"--limit=-1"}, "must not be negative"},
+		{"large negative limit", []string{"--limit=-99999"}, "must not be negative"},
 	}
 
 	for _, tc := range tests {
