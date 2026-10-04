@@ -105,6 +105,11 @@ func TestStrokesSinceLimitZeroMeansNoLimit(t *testing.T) {
 // TestStrokesNearIsAlsoNewestLast keeps the two reads consistent, because the
 // history command truncates the radius query in process and would otherwise keep
 // the wrong end of it.
+//
+// It also pins *which* rows the read budget is spent on. The limit here bounds rows
+// read rather than rows returned, and a LIMIT over an ascending scan keeps the
+// oldest — so a busy region answered a question about the last 24 hours with the
+// first 10000 rows of it, and every timestamp it printed was a day stale.
 func TestStrokesNearIsAlsoNewestLast(t *testing.T) {
 	s, _ := openStore(t)
 	base := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
@@ -128,6 +133,9 @@ func TestStrokesNearIsAlsoNewestLast(t *testing.T) {
 		if got[i-1].Time.After(got[i].Time) {
 			t.Fatalf("StrokesNear result is not ascending in time at %d", i)
 		}
+	}
+	if got[len(got)-1].StrokeID != 5 {
+		t.Errorf("last stroke id = %d, want 5 (the newest)", got[len(got)-1].StrokeID)
 	}
 }
 

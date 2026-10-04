@@ -260,12 +260,19 @@ func (s *Store) StrokesNear(ctx context.Context, c geo.Circle, since time.Time) 
 	// exact distance test runs afterwards, and a cell only intersects the circle
 	// loosely, so a LIMIT applied after that test would silently return fewer
 	// strokes than were asked for while looking like a complete answer.
+	//
+	// Because the limit is a read budget rather than a result size, it has to be
+	// spent on the newest rows: a LIMIT over an ascending scan keeps the oldest,
+	// so a busy region answered a question about the last 24 hours with the first
+	// 10000 rows of it and timestamps a day stale. Descending and reversing
+	// afterwards keeps both the budget and the documented newest-last order aimed
+	// at the same end.
 	const q = `
 SELECT src, stroke_id, time_ms, received_ms, lat, lon, deviation_m, delay_ms, cell, certainty
   FROM stroke
  WHERE time_ms >= ?
    AND cell IN (SELECT value FROM json_each(?))
- ORDER BY time_ms
+ ORDER BY time_ms DESC
  LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, since.UnixMilli(), string(encoded), maxRows)
@@ -287,6 +294,11 @@ SELECT src, stroke_id, time_ms, received_ms, lat, lon, deviation_m, delay_ms, ce
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: reading rows: %w", err)
+	}
+
+	// Restore the documented newest-last order, which the DESC scan inverted.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
 }
@@ -456,13 +468,21 @@ func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 
 // PruneCursors deletes resume entries older than the cutoff. A cursor for a
 // network that has been quiet for weeks is not worth keeping.
+//
+// RowsAffected's error is handled rather than discarded. Prune does the same
+// four lines up, and a driver that cannot report the count here is telling us
+// something about the connection that the caller would want to hear about instead
+// of a silent zero.
 func (s *Store) PruneCursors(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM upstream_cursor WHERE last_time_ms < ?`, cutoff.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("store: pruning cursors: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: counting pruned cursors: %w", err)
+	}
 	return n, nil
 }
 
