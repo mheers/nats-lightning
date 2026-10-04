@@ -238,6 +238,20 @@ func (p *Publisher) Publish(ctx context.Context, s model.Stroke) error {
 		// own.
 		Header: nats.Header{nats.MsgIdHdr: []string{event.ID}},
 	}
+	// The context is checked but cannot be passed through: nats.go v1.48's
+	// JetStreamContext.PublishMsg takes only a message and functional options, and
+	// no publish option carries a context — nats.Context() there applies to consumer
+	// operations, not to publishing. So an in-flight publish waits out JetStream's
+	// own acknowledgement timeout and cannot be interrupted.
+	//
+	// Checking here is still the half that is available, and worth having: it stops
+	// a shutdown from *starting* a publish it already knows it does not want. What
+	// remains is bounded by that acknowledgement timeout, once per stroke already in
+	// flight when the context was cancelled.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("feed: publishing %s: %w", s.Key(), err)
+	}
+
 	if _, err := p.js.PublishMsg(msg); err != nil {
 		return fmt.Errorf("feed: publishing %s: %w", event.ID, err)
 	}

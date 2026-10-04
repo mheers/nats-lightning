@@ -133,6 +133,28 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 	}
 
 	// Leadership before anything that writes or connects.
+	//
+	// The renewal goroutine starts here, immediately after the lease is taken,
+	// rather than further down where the pipeline is wired up. Everything between
+	// the two points runs holding a lease that nobody is refreshing: opening the
+	// store, re-enumerating and writing the whole cell list, resuming the cursor,
+	// ensuring the stream and binding the metrics port. The lease TTL is 30s and the
+	// first renewal is 10s after Run begins, so for a large region that sequence can
+	// outlast the lease — at which point a standby acquires it while this process
+	// goes on to open the upstream socket, giving two upstream connections for up to
+	// one renewal interval. Nothing detected that until the first renew() failed,
+	// long after the second connection existed.
+	leaderCtx, stopLeader := context.WithCancel(ctx)
+	defer stopLeader()
+
+	// The lease failure has to be carried out of the goroutine that watches it.
+	//
+	// Cancelling the pipeline is the only lever that watcher has, and a cancelled
+	// pipeline makes client.Run return context.Canceled. Mapping that to a nil error
+	// reported a lost lease as a clean shutdown, so leaderFailure exists to carry the
+	// reason out to where the exit status is decided.
+	var leaderFailure leadershipFailure
+
 	var lock *elect.Lock
 	if cfg.LeaderElect {
 		lock, err = elect.NewLock(js, "lightningfeed", elect.Options{
@@ -147,6 +169,18 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 		if err := lock.Acquire(ctx); err != nil {
 			return fmt.Errorf("acquiring leadership: %w", err)
 		}
+
+		go func() {
+			err := lock.Run(leaderCtx)
+			// A cancelled context means we asked for this, so it is a shutdown
+			// rather than a loss.
+			if leaderCtx.Err() != nil || err == nil {
+				return
+			}
+			logger.Error("leadership lost, shutting down", "error", err)
+			leaderFailure.set(err)
+			stopLeader()
+		}()
 	}
 
 	// The store belongs to the leader, which the lease now guarantees.
@@ -273,34 +307,9 @@ func RunWith(ctx context.Context, cfg *config.Config, ready func(*Runner)) error
 		ready(&Runner{MetricsAddr: server.Addr(), Metrics: metrics})
 	}
 
-	// Renew the lease alongside the stream. Losing it means another process is
-	// now the writer, and continuing would mean two writers on one database and
-	// two upstream connections.
-	leaderCtx, stopLeader := context.WithCancel(ctx)
-	defer stopLeader()
-
-	// The lease failure has to be carried out of the goroutine that watches it.
-	//
-	// Cancelling the pipeline is the only lever that watcher has, and a cancelled
-	// pipeline makes client.Run return context.Canceled. Mapping that to a nil
-	// error reported a lost lease as a clean shutdown: the process exited 0, so a
-	// supervisor's Restart=on-failure brought nothing back and the bridge had
-	// quietly stopped feeding data while every exit signal said otherwise.
-	var leaderFailure leadershipFailure
-
-	if lock != nil {
-		go func() {
-			err := lock.Run(leaderCtx)
-			// A cancelled context means we asked for this, so it is a shutdown
-			// rather than a loss.
-			if leaderCtx.Err() != nil || err == nil {
-				return
-			}
-			logger.Error("leadership lost, shutting down", "error", err)
-			leaderFailure.set(err)
-			stopLeader()
-		}()
-	}
+	// The lease is renewed by the goroutine started immediately after it was
+	// acquired, before the store was opened, so that nothing below runs unrenewed.
+	// Losing it cancels leaderCtx, which is what stops the pipeline below.
 
 	// Report connection state and upstream counters into the metrics. The
 	// client's counters are monotonic totals and the gauges are point-in-time
@@ -639,6 +648,14 @@ func startCursorSaver(
 
 		// Write once straight away so a restart within the first interval still
 		// finds a cursor.
+		//
+		// This has to actually happen. The comment used to promise it while the
+		// first save waited for the first tick, so the first 30 seconds of every
+		// process wrote no cursor at all — which is exactly the window the comment
+		// said it was protecting. Combined with the guard below, a process that
+		// died inside that window found an empty cursor table and replayed the
+		// upstream's full five minutes: once per crash-loop and once per rolling
+		// deploy.
 		save := func() {
 			c := store.Cursor{Sources: map[model.Source]int64{}, Server: upstreamURL}
 			for _, src := range []model.Source{model.SourceBlitzortung, model.SourceLightningMaps} {
@@ -653,6 +670,8 @@ func startCursorSaver(
 				logger.Error("saving the resume cursor", "error", err)
 			}
 		}
+
+		save()
 
 		for {
 			select {
