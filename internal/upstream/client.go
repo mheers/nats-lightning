@@ -67,6 +67,18 @@ type Options struct {
 	ReconnectMin time.Duration
 	ReconnectMax time.Duration
 
+	// OnSessionStart is called once per session, after the upstream's hello and
+	// before any stroke is delivered.
+	//
+	// It exists for replay suppression: the upstream replays about five minutes
+	// of history on every connection, so the pipeline has to open a backfill
+	// window at exactly this moment. Wiring that here rather than in the caller
+	// is what makes the layer work at all — it was previously defined on the
+	// dedup filter and never called from anywhere in the pipeline.
+	//
+	// Nil means no callback.
+	OnSessionStart func()
+
 	// Logger receives diagnostics. Nil means discard.
 	Logger *slog.Logger
 }
@@ -110,11 +122,24 @@ type Sink func(ctx context.Context, stroke model.Stroke) error
 type Client struct {
 	opts Options
 
-	reconnects  atomic.Int64
-	malformed   atomic.Int64
+	reconnects atomic.Int64
+	malformed  atomic.Int64
+	rejected   atomic.Int64
+
 	lastSeen    sync.Map // model.Source -> int64
 	hello       atomic.Pointer[Hello]
 	lastMessage atomic.Pointer[time.Time]
+
+	// connected is the authoritative answer to "is there a live socket", and is
+	// deliberately separate from lastMessage.
+	//
+	// Deriving it from lastMessage - as this once did - is wrong in exactly the
+	// case that matters: lastMessage is only cleared once a dial succeeds, so
+	// during a failed reconnect, which is this upstream's dominant failure mode
+	// (silent hangs), the client kept reporting itself connected while it slept
+	// through its backoff. A readiness probe built on that answer reports ready
+	// during precisely the outage it exists to detect.
+	connected atomic.Bool
 }
 
 // New returns a client. The connection is not made until Run is called.
@@ -136,8 +161,17 @@ func (c *Client) seedLastSeen(m map[model.Source]int64) {
 // Reconnects returns how many times the client has re-established a connection.
 func (c *Client) Reconnects() int64 { return c.reconnects.Load() }
 
-// MalformedFrames returns how many frames failed to decode.
+// MalformedFrames returns how many frames failed to decode entirely.
 func (c *Client) MalformedFrames() int64 { return c.malformed.Load() }
+
+// RejectedStrokes returns how many individual strokes were dropped because they
+// could not be normalised, while the frames carrying them decoded fine.
+//
+// This is deliberately not folded into MalformedFrames. The two mean different
+// things to an operator: a rising frame count points at the transport or the
+// protocol, whereas a rising stroke count points at bad data inside otherwise
+// healthy batches.
+func (c *Client) RejectedStrokes() int64 { return c.rejected.Load() }
 
 // Hello returns the upstream's greeting from the current or last connection.
 func (c *Client) Hello() *Hello { return c.hello.Load() }
@@ -151,8 +185,14 @@ func (c *Client) LastSeen(src model.Source) int64 {
 	return 0
 }
 
-// Connected reports whether the client currently holds a live connection.
-func (c *Client) Connected() bool { return c.lastMessage.Load() != nil }
+// Connected reports whether the client currently holds a live upstream socket.
+//
+// It is false from the moment a session ends until the next handshake
+// completes, which includes the whole of every reconnect backoff. It must not be
+// derived from the last message time: the upstream's characteristic failure is a
+// silent hang, so the gap between sessions is routinely minutes long and a stale
+// frame would otherwise read as a healthy connection throughout it.
+func (c *Client) Connected() bool { return c.connected.Load() }
 
 // Run connects, streams strokes into sink, and reconnects until ctx ends.
 //
@@ -160,6 +200,7 @@ func (c *Client) Connected() bool { return c.lastMessage.Load() != nil }
 // sink fails, and any error that makes reconnecting pointless.
 func (c *Client) Run(ctx context.Context, sink Sink) error {
 	for {
+		started := time.Now()
 		err := c.session(ctx, sink)
 		switch {
 		case ctx.Err() != nil:
@@ -173,6 +214,16 @@ func (c *Client) Run(ctx context.Context, sink Sink) error {
 		var se sinkError
 		if errors.As(err, &se) {
 			return se.err
+		}
+
+		// A session that ran long enough to be considered healthy resets the
+		// backoff. Without this the counter is cumulative for the life of the
+		// process, so a deployment that reconnects every few hours would drift
+		// to the ceiling after a few days and then sit there permanently, even
+		// though every one of those sessions was fine. Only a run of quick
+		// failures should escalate the delay.
+		if time.Since(started) >= healthySession {
+			c.reconnects.Store(0)
 		}
 
 		delay := c.backoff()
@@ -199,12 +250,23 @@ type sinkError struct{ err error }
 func (e sinkError) Error() string { return "sink: " + e.err.Error() }
 func (e sinkError) Unwrap() error { return e.err }
 
+// healthySession is how long a session must last to count as healthy and reset
+// the backoff.
+//
+// It sits above the upstream's roughly ten second heartbeat by a wide margin,
+// so a connection that received frames and then died is not mistaken for a
+// healthy one, while a connection that worked for a few minutes plainly was.
+const healthySession = 2 * time.Minute
+
 // backoff returns the next retry delay, doubling from the floor to the ceiling
 // with jitter. Jitter matters because several instances failing over together
 // would otherwise reconnect in lockstep and hit the throttling together.
 func (c *Client) backoff() time.Duration {
 	n := c.reconnects.Load()
 	delay := c.opts.ReconnectMin
+	// n is the number of consecutive quick failures, and it is reset once a
+	// session is healthy, so this loop is bounded in practice. The break keeps
+	// it bounded by construction regardless.
 	for range n {
 		if delay >= c.opts.ReconnectMax {
 			break
@@ -221,6 +283,14 @@ func (c *Client) backoff() time.Duration {
 
 // session runs one connection to exhaustion.
 func (c *Client) session(ctx context.Context, sink Sink) error {
+	// Clear the connection state before dialling rather than after a successful
+	// dial. This is the whole point of tracking it separately: the upstream's
+	// failure mode is a silent hang, so the time between a session ending and
+	// the next one succeeding can be minutes, and the client must report itself
+	// disconnected throughout.
+	c.connected.Store(false)
+	c.lastMessage.Store(nil)
+
 	dialCtx, cancelDial := context.WithTimeout(ctx, c.opts.HandshakeTimeout)
 	defer cancelDial()
 
@@ -231,7 +301,6 @@ func (c *Client) session(ctx context.Context, sink Sink) error {
 	defer conn.CloseNow()
 
 	conn.SetReadLimit(1 << 20) // 1 MiB; upstream batches top out around 60 KiB
-	c.lastMessage.Store(nil)
 
 	// Subscribe. The upstream requires at least "v" and "i"; the remaining
 	// fields mirror what the website sends so the frame is indistinguishable
@@ -247,8 +316,21 @@ func (c *Client) session(ctx context.Context, sink Sink) error {
 		return err
 	}
 
+	// Only now is there a live socket. Before this point a dial that hangs or a
+	// handshake that never completes must not read as connected.
+	c.connected.Store(true)
+	defer c.connected.Store(false)
+
 	c.opts.Logger.Info("connected to upstream",
 		"url", c.opts.URL, "hello", c.Hello(), "viewport", c.opts.Viewport)
+
+	// The session is live, so a consumer that needs to suppress the replay the
+	// upstream sends on every connect can open its window now. Doing it here
+	// rather than at dial time is deliberate: the backfill that follows is
+	// measured from the moment data starts arriving.
+	if c.opts.OnSessionStart != nil {
+		c.opts.OnSessionStart()
+	}
 
 	return c.readLoop(ctx, conn, sink)
 }
@@ -333,12 +415,24 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, sink Sink) 
 
 		frame, err := ParseFrame(raw)
 		if err != nil {
-			// One bad frame is a hiccup, not an outage. Log it, count it, and
-			// carry on reading.
+			// The frame itself will not decode. One bad frame is a hiccup, not an
+			// outage: log it, count it, and carry on reading.
 			c.malformed.Add(1)
 			c.opts.Logger.Warn("skipping undecodable frame",
 				"error", err, "bytes", len(raw))
 			continue
+		}
+
+		// The frame decoded but some strokes in it did not. Count them
+		// separately from undecodable frames so a single bad coordinate in a
+		// 500-stroke batch does not look like an upstream outage, and keep the
+		// strokes that were fine.
+		if frame.Rejected > 0 {
+			c.rejected.Add(int64(frame.Rejected))
+			c.opts.Logger.Warn("dropped unusable strokes from an otherwise good frame",
+				"dropped", frame.Rejected,
+				"kept", len(frame.Strokes),
+				"reason", frame.RejectReason)
 		}
 
 		c.touch()
@@ -400,6 +494,11 @@ func (c *Client) touch() {
 }
 
 // record advances the resume cursor for a source.
+//
+// The cursor only ever moves forward. The upstream replays history on every
+// connect, so a replayed stroke carries a lower id than the newest one already
+// seen, and adopting it would rewind the cursor and make the next resume replay
+// that window all over again.
 func (c *Client) record(s model.Stroke) {
 	for {
 		prev := c.LastSeen(s.Src)
@@ -407,8 +506,9 @@ func (c *Client) record(s model.Stroke) {
 			return
 		}
 		if _, loaded := c.lastSeen.LoadOrStore(s.Src, s.StrokeID); loaded {
-			// Replace only if still behind, so concurrent batches cannot
-			// rewind the cursor.
+			// Only this goroutine writes, so a re-read is not a race: it is the
+			// same value unless a larger id has already been recorded, in which
+			// case leaving it alone is the point.
 			if c.LastSeen(s.Src) < s.StrokeID {
 				c.lastSeen.Store(s.Src, s.StrokeID)
 			}

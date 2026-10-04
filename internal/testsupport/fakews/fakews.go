@@ -57,6 +57,16 @@ type Server struct {
 	// client's idle watchdog correctly reconnects and the script replays.
 	HeartbeatForever bool
 
+	// FramesPerConnection makes Frames repeat on every connection rather than
+	// being consumed once.
+	//
+	// The real upstream replays about five minutes of history each time it accepts a
+	// connection, so a client that only ever sees each frame once is not being
+	// tested against the behaviour that actually matters. A server that needs to
+	// distinguish sessions — a cold start from a reconnect, say — sets this and
+	// watches ConnectionCount.
+	FramesPerConnection bool
+
 	// SubscribeFunc observes each subscribe frame the client sends.
 	SubscribeFunc func(raw []byte)
 
@@ -100,6 +110,10 @@ func (s *Server) Connections() int {
 	defer s.mu.Unlock()
 	return s.connections
 }
+
+// ConnectionCount is Connections under a name that reads better at a call site
+// comparing it against an expected number of sessions.
+func (s *Server) ConnectionCount() int { return s.Connections() }
 
 // Close indicates a client disconnected.
 func (s *Server) ClosedByPeer() bool {
@@ -180,20 +194,46 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for _, f := range s.Frames {
-		if s.FrameDelay > 0 {
-			select {
-			case <-ctx.Done():
+	// The upstream replays its recent history on every connection, so a client
+	// that only tolerates a replay once has not been tested against the real
+	// behaviour. Replaying the script each time round is what lets a test assert
+	// that the second and third sessions are suppressed just like the first.
+	//
+	// Repetition is per connection, not per pass within one. A session that is
+	// scripted to hang open keeps re-sending the batch until the client gives
+	// up on it, which is what makes an idle-watchdog test meaningful; a session
+	// scripted to close sends the batch once and ends.
+	repeats := s.FramesPerConnection && s.HangAfterFrames
+
+	for {
+		for _, f := range s.Frames {
+			if s.FrameDelay > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(s.FrameDelay):
+				}
+			} else if repeats {
+				// A zero delay here would spin the CPU as fast as the socket
+				// accepts, which is neither realistic nor useful in a test.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Millisecond):
+				}
+			}
+			out := f
+			if s.HonourSourceMask {
+				out = filterFrameByMask(f, s.subscribeMask)
+			}
+			if err := conn.Write(ctx, websocket.MessageText, []byte(out)); err != nil {
 				return
-			case <-time.After(s.FrameDelay):
 			}
 		}
-		out := f
-		if s.HonourSourceMask {
-			out = filterFrameByMask(f, s.subscribeMask)
-		}
-		if err := conn.Write(ctx, websocket.MessageText, []byte(out)); err != nil {
-			return
+
+		// A session that is not repeating has sent everything it will send.
+		if !repeats {
+			break
 		}
 	}
 
