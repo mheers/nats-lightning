@@ -1,0 +1,222 @@
+// Command lightningfeed bridges the lightningmaps.org real-time feed into NATS.
+//
+// It is a private, non-commercial deployment. Lightning data is
+// (c) Blitzortung.org contributors, licensed CC BY-SA 4.0; the upstream's terms
+// require that consumers read from a separate server rather than connecting to
+// Blitzortung themselves, which is exactly what this bridge is.
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/heers-it/lightningfeed/internal/config"
+	"github.com/heers-it/lightningfeed/internal/feed"
+	"github.com/heers-it/lightningfeed/internal/ingest"
+	"github.com/heers-it/lightningfeed/internal/upstream"
+)
+
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+func main() {
+	if err := newRoot().Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "lightningfeed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func newRoot() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "lightningfeed",
+		Short: "Bridge real-time lightning strokes onto NATS",
+		Long: strings.TrimSpace(`
+Bridges the lightningmaps.org real-time stroke feed into a NATS JetStream
+stream, and archives it in SQLite for radius queries.
+
+Lightning data (c) Blitzortung.org contributors, CC BY-SA 4.0. Non-commercial
+use only. The upstream's terms require consumers to read from a separate server
+rather than connecting to Blitzortung directly; this process holds that single
+connection on your behalf.`),
+		SilenceUsage: true,
+		Version:      buildVersion(),
+	}
+
+	root.AddCommand(newIngestCmd())
+	root.AddCommand(newHistoryCmd())
+	root.AddCommand(newCellsCmd())
+	return root
+}
+
+// buildVersion reports the build, including the module version when stamped at
+// release time.
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" {
+		return version
+	}
+	if version != "dev" {
+		return version
+	}
+	return info.Main.Version
+}
+
+func newIngestCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "ingest",
+		Short: "Run the bridge: upstream to NATS and SQLite",
+		Long: strings.TrimSpace(`
+Connects to the upstream, suppresses replays, filters to the configured
+region, publishes to NATS and archives to SQLite.
+
+Only the elected leader connects to the upstream. The upstream throttles new
+connections severely, so a second concurrent connection is actively harmful; the
+leader lease guarantees exactly one.`),
+		// The flags are defined by internal/config, not by cobra, so cobra is
+		// told to pass arguments through untouched.
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.ParseFromEnv(args)
+			if err != nil {
+				return err
+			}
+			return ingest.Run(cmd.Context(), cfg)
+		},
+	}
+	return cmd
+}
+
+func newHistoryCmd() *cobra.Command {
+	var (
+		since string
+		limit int
+	)
+
+	cmd := &cobra.Command{
+		Use:   "history",
+		Short: "Query archived strokes near the configured region",
+		Long: strings.TrimSpace(`
+Reads strokes from SQLite rather than NATS, because a radius query is not
+something subject filtering can answer.
+
+Reads the archive directly and does not disturb a running ingest. The database
+file belongs to the leader process; opening it read-only is safe.`),
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// These three are history-specific rather than pipeline-wide, so
+			// they are stripped before the shared configuration sees them;
+			// otherwise it would reject them as unknown flags.
+			rest, err := extractHistoryFlags(args, &since, &limit)
+			if err != nil {
+				return err
+			}
+			cfg, err := config.ParseFromEnv(rest)
+			if err != nil {
+				return err
+			}
+			return ingest.PrintHistory(cmd.Context(), cfg, since, limit)
+		},
+	}
+	return cmd
+}
+
+// extractHistoryFlags pulls the history-only flags out of an argument list.
+//
+// These three are specific to the history command rather than the pipeline, so
+// they are stripped before the shared configuration parser sees them; it would
+// otherwise reject them as unknown. Both the "--flag value" and "--flag=value"
+// spellings are accepted, as the standard flag package accepts both.
+func extractHistoryFlags(args []string, since *string, limit *int) ([]string, error) {
+	var rest []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, inline, hasInline := strings.Cut(arg, "=")
+
+		value := func() (string, error) {
+			if hasInline {
+				return inline, nil
+			}
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("%s needs a value", name)
+			}
+			i++
+			return args[i], nil
+		}
+
+		switch name {
+		case "--since", "--limit":
+		default:
+			rest = append(rest, arg)
+			continue
+		}
+
+		v, err := value()
+		if err != nil {
+			return nil, err
+		}
+		switch name {
+		case "--since":
+			*since = v
+		case "--limit":
+			if *limit, err = strconv.Atoi(v); err != nil {
+				return nil, fmt.Errorf("--limit %q: %w", v, err)
+			}
+		}
+	}
+	return rest, nil
+}
+
+func newCellsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cells",
+		Short: "List the geohash cells the configured region publishes to",
+		Long: strings.TrimSpace(`
+Prints the subject cells for the configured region.
+
+Useful when wiring up a consumer: a region subscriber needs exactly these
+subjects, and printing them avoids reimplementing the cell enumeration.`),
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.ParseFromEnv(args)
+			if err != nil {
+				return err
+			}
+			cells, err := cfg.Cells()
+			if err != nil {
+				return err
+			}
+			if len(cells) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "no region configured; every subject is published")
+				return nil
+			}
+
+			// Resolve the source code the mask selects, so the printed subjects
+			// are the ones a consumer would actually subscribe to.
+			src := 0
+			for _, bit := range []upstream.SrcMask{
+				upstream.MaskReserved, upstream.MaskBlitzortung,
+				upstream.MaskLightningMaps, upstream.MaskTesting,
+			} {
+				if cfg.SourceMask&bit == 0 {
+					continue
+				}
+				if code, ok := bit.SrcForMask(); ok {
+					src = int(code)
+				}
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "%s: %d cells, radius %.4g km around %.4f,%.4f\n\n",
+				cfg.RegionName, len(cells), cfg.Region.RadiusKm, cfg.Region.Lat, cfg.Region.Lon)
+			for _, c := range cells {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s.src.%d.cell.%s\n", feed.SubjectPrefix, src, c)
+			}
+			return nil
+		},
+	}
+}

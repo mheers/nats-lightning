@@ -1,0 +1,74 @@
+# systemd unit for the lightningfeed bridge.
+#
+# One instance is enough and more than one is actively harmful: the upstream
+# throttles new connections severely, and only the elected leader connects at
+# all. Running several replicas is supported, but do not expect all of them to
+# be doing anything - that is the design.
+#
+# Install:
+#   install -m 0755 lightningfeed /usr/local/bin/lightningfeed
+#   install -m 0644 deploy/lightningfeed.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now lightningfeed
+
+[Unit]
+Description=lightningfeed: lightning strokes onto NATS
+Documentation=https://github.com/heers-it/lightningfeed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lightningfeed ingest \
+  --nats-url=nats://127.0.0.1:4222 \
+  --region-name=roussospiti \
+  --region-lat=35.3340688 \
+  --region-lon=24.4944483 \
+  --region-radius-km=10 \
+  --sqlite=/var/lib/lightningfeed/lightningfeed.db \
+  --metrics-addr=:9109 \
+  --log-format=json
+
+# Credentials belong here rather than in ExecStart, where they are visible in the
+# process list.
+Environment=LIGHTNINGFEED_LOG_LEVEL=info
+
+# The bridge writes to the database directory and nothing else.
+StateDirectory=lightningfeed
+WorkingDirectory=/var/lib/lightningfeed
+
+User=lightningfeed
+Group=lightningfeed
+
+Restart=always
+RestartSec=30
+
+# The reconnect floor is 15s because the upstream throttles reconnects. Restarting
+# faster than that would be throttled just as effectively, so give systemd a delay
+# in the same range.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Signal handling is graceful: the process stops the upstream connection and
+# releases its leadership lease so a standby can take over immediately rather
+# than waiting out the lease.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening. The process needs no privileges, no ambient capabilities, and no
+# writable paths beyond its state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/lightningfeed
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

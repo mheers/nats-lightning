@@ -314,3 +314,7 @@ func (p *Publisher) Cells() []string {
 	}
 	return out
 }
+
+// CellSet converts a cell list to a membership set for the ingest stage, which
+// needs to test a stroke's cell without reaching into the publisher's internals.
+func CellSet(cells []string) map[string]struct{} { return geo.ToSet(cells) }

@@ -425,3 +425,15 @@ func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false 
 func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
 func (h discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
 func (h discardHandler) WithGroup(string) slog.Handler           { return h }
+
+// LastMessage returns when the last frame arrived, or the zero time if the
+// connection has not produced one.
+//
+// The health probe and the metrics both need this, and either one reaching into
+// the client's own fields would be a coupling worth avoiding.
+func (c *Client) LastMessage() time.Time {
+	if t := c.lastMessage.Load(); t != nil {
+		return *t
+	}
+	return time.Time{}
+}
