@@ -60,9 +60,14 @@ const (
 // Config is the fully resolved configuration.
 type Config struct {
 	// NATS
-	NATSURL   string
-	Stream    string
-	JetStream bool
+	//
+	// There is no JetStream toggle. The publisher needs JetStream: it registers a
+	// message id per stroke and relies on the broker's duplicate window to absorb
+	// a reconnect replay, which Core NATS cannot do. NewPublisher fails outright
+	// if JetStream is unavailable, so a flag choosing between them could only ever
+	// be a way to fail.
+	NATSURL string
+	Stream  string
 
 	// Region. A zero Circle means world-wide.
 	RegionName     string
@@ -71,8 +76,13 @@ type Config struct {
 	BoundaryPolicy geo.BoundaryPolicy
 
 	// Upstream
+	//
+	// There is no failover URL. The two upstream servers issue independent id
+	// sequences, so a cursor carried between them is not a resume; the client
+	// warns and starts cold rather than resuming across the boundary. live2 is
+	// never dialled automatically. Callers wanting the second server should point
+	// UpstreamURL at it deliberately and accept the cold start.
 	UpstreamURL      string
-	UpstreamFailover string
 	SourceMask       upstream.SrcMask
 	ReconnectMin     time.Duration
 	ReconnectMax     time.Duration
@@ -161,10 +171,8 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	cfg := &Config{
 		NATSURL:          "nats://127.0.0.1:4222",
 		Stream:           "LIGHTNING",
-		JetStream:        true,
 		BoundaryPolicy:   geo.PolicyInclude,
 		UpstreamURL:      "wss://live.lightningmaps.org:443/",
-		UpstreamFailover: "wss://live2.lightningmaps.org:443/",
 		SourceMask:       upstream.DefaultSrcMask,
 		ReconnectMin:     DefaultReconnectMin,
 		ReconnectMax:     DefaultReconnectMax,
@@ -187,7 +195,6 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	fs := flag.NewFlagSet("lightningfeed", flag.ContinueOnError)
 	fs.StringVar(&cfg.NATSURL, "nats-url", cfg.NATSURL, "NATS server URL")
 	fs.StringVar(&cfg.Stream, "stream", cfg.Stream, "JetStream stream name")
-	fs.BoolVar(&cfg.JetStream, "jetstream", cfg.JetStream, "use JetStream rather than Core NATS")
 
 	fs.StringVar(&cfg.RegionName, "region-name", "", "region name, for labels")
 	fs.Float64Var(&cfg.Region.Lat, "region-lat", 0, "region centre latitude")
@@ -197,7 +204,6 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		"treat undecidable strokes as inside: include or exclude")
 
 	fs.StringVar(&cfg.UpstreamURL, "upstream-url", cfg.UpstreamURL, "upstream WebSocket URL")
-	fs.StringVar(&cfg.UpstreamFailover, "upstream-failover", cfg.UpstreamFailover, "failover upstream URL")
 	fs.IntVar((*int)(&cfg.SourceMask), "src-mask", int(cfg.SourceMask),
 		"source bitmask: 1 reserved, 2 Blitzortung.org, 4 LightningMaps.org, 8 test")
 	fs.DurationVar(&cfg.ReconnectMin, "reconnect-min", cfg.ReconnectMin,
@@ -235,6 +241,11 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
+	cfg.markSupplied(fs)
+
+	if err := setLevel(&cfg.LogLevel, logLevel); err != nil {
+		return nil, fmt.Errorf("config: --log-level: %w", err)
+	}
 
 	// An unparseable environment value must be an error, not a silent no-op: a
 	// typo in a unit file would otherwise leave the default in place and the
@@ -247,11 +258,6 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 	// where the documented precedence was a lie.
 	if err := applyEnv(getenv, cfg); err != nil {
 		return nil, err
-	}
-	cfg.markSupplied(fs)
-
-	if err := setLevel(&cfg.LogLevel, logLevel); err != nil {
-		return nil, fmt.Errorf("config: --log-level: %w", err)
 	}
 
 	if err := cfg.finalize(); err != nil {

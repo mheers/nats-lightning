@@ -213,12 +213,22 @@ func (s *Store) Count(ctx context.Context, since time.Time) (int64, error) {
 
 // maxRows bounds any history read, so a consumer cannot ask for everything ever
 // recorded and exhaust memory.
+//
+// It bounds rows read from SQLite, not rows returned. Applying it after the exact
+// distance test would cap the answer at a number that has nothing to do with the
+// question, and a caller would have no way to tell a truncated result from a quiet
+// hour.
 const maxRows = 10000
 
 // StrokesNear returns strokes within the circle since the given time.
 //
 // This is the query the whole store exists for: a subject-filtered subscription
 // cannot answer it, because a radius is not a subject.
+//
+// Rows are read up to maxRows and then filtered by exact distance, so a cell that
+// only clips the circle still consumes part of that budget. The result is complete
+// with respect to the rows read, and at the observed rates for a region of this
+// size the cap is never reached.
 func (s *Store) StrokesNear(ctx context.Context, c geo.Circle, since time.Time) ([]StoredStroke, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -246,6 +256,10 @@ func (s *Store) StrokesNear(ctx context.Context, c geo.Circle, since time.Time) 
 		return nil, fmt.Errorf("store: encoding region cells: %w", err)
 	}
 
+	// The limit bounds how many rows are read, not how many are returned. The
+	// exact distance test runs afterwards, and a cell only intersects the circle
+	// loosely, so a LIMIT applied after that test would silently return fewer
+	// strokes than were asked for while looking like a complete answer.
 	const q = `
 SELECT src, stroke_id, time_ms, received_ms, lat, lon, deviation_m, delay_ms, cell, certainty
   FROM stroke
@@ -442,15 +456,13 @@ func (s *Store) PruneCursors(ctx context.Context, cutoff time.Time) (int64, erro
 	return n, nil
 }
 
-// Region is a persisted region definition, so a restart does not have to
-// rediscover which cells to publish to.
-type Region struct {
-	Name      string
-	Circle    geo.Circle
-	CellCount int
-}
-
 // SaveRegion stores the region definition.
+//
+// Nothing in the process reads this back: the region is configuration, so it comes
+// from the flags on every start rather than from the database. It is kept as a
+// plain row so an operator can tell after the fact which cells a given archive was
+// actually collecting for, which is not otherwise recoverable from the strokes
+// themselves. LoadRegion was removed with its readers.
 func (s *Store) SaveRegion(ctx context.Context, name string, c geo.Circle) error {
 	cells, err := c.Cells(geo5Precision)
 	if err != nil {
@@ -472,43 +484,3 @@ ON CONFLICT(id) DO UPDATE SET
 	}
 	return nil
 }
-
-// LoadRegion reads the persisted region definition.
-func (s *Store) LoadRegion(ctx context.Context) (Region, error) {
-	var (
-		r        Region
-		lat, lon float64
-		encoded  string
-	)
-	err := s.db.QueryRowContext(ctx,
-		`SELECT name, lat, lon, radius_km, cells FROM region WHERE id = 1`).
-		Scan(&r.Name, &lat, &lon, &r.Circle.RadiusKm, &encoded)
-	switch {
-	case err == sql.ErrNoRows:
-		return Region{}, fmt.Errorf("store: no region is configured")
-	case err != nil:
-		return Region{}, fmt.Errorf("store: loading region: %w", err)
-	}
-
-	r.Circle.Lat = lat
-	r.Circle.Lon = lon
-
-	var cells []string
-	if err := json.Unmarshal([]byte(encoded), &cells); err != nil {
-		return Region{}, fmt.Errorf("store: decoding region cells: %w", err)
-	}
-	r.CellCount = len(cells)
-	return r, nil
-}
-
-// regionTable exists so the schema statement above stays in one place.
-const regionTable = `
-CREATE TABLE IF NOT EXISTS region (
-    id        INTEGER PRIMARY KEY CHECK (id = 1),
-    name      TEXT NOT NULL,
-    lat       REAL NOT NULL,
-    lon       REAL NOT NULL,
-    radius_km REAL NOT NULL,
-    cells     TEXT NOT NULL
-);
-`
