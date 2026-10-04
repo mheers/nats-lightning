@@ -98,6 +98,14 @@ turn a regional deployment into a global one.
 A region on the equator or the prime meridian is legitimate: a `0` is treated as
 supplied, not missing.
 
+**The radius is capped at 2500 km.** Cell enumeration is O(area) and its result is
+held in memory, written to the archive as JSON, and re-parsed on every radius query,
+so 10000 km is 18.3 million cells and roughly a gigabyte. If you want more than that,
+omit the region and publish world-wide, which needs no cell list at all.
+
+Regions that cross the antimeridian (Fiji, Kiribati, the Chatham Islands) are
+handled: the cell list wraps.
+
 **JetStream is not optional.** The publisher registers a message id per stroke and
 relies on the broker's duplicate window to absorb a reconnect replay, which Core
 NATS cannot do; startup fails outright if JetStream is unavailable. There is
@@ -213,6 +221,12 @@ So every stroke is classified rather than forced into a boolean:
 | `boundary` | `dist - dev ≤ radius < dist + dev` | undecidable |
 | `out` | `dist - dev > radius` | certainly outside |
 
+`dev` is bounded: a negative figure counts as zero and one above 100 km is capped.
+`dev` arrives as an optional integer, so `INT_MAX` — the commonest "no data"
+sentinel in this protocol family — is representable, and unclamped it would make
+every stroke within `radius + dev` undecidable, which the default policy accepts.
+One stroke carrying a sentinel would then publish the whole planet.
+
 **`boundary` strokes count as inside** (`--boundary-policy include`, the
 default): a missed stroke is worse than a slightly misplaced one. The band is
 still carried on every message and stored per row, so `--boundary-policy exclude`
@@ -251,6 +265,13 @@ always local.
 JSON numbers, the HTTP long-poll fallback as strings. Both are accepted; a plain
 `float64` would have silently yielded `0.0` and placed every fallback stroke at
 the null island.
+
+**A coordinate that is not a coordinate is rejected, not coerced.** `null`, `""` and
+an absent field are all dropped per stroke and counted as `bad_coordinate`; a
+genuine `0` is a real coordinate and is kept. The absent case is the one that
+matters: the feed is undocumented and can change at any time, and a renamed field
+would otherwise arrive as a stream of lightning reported off the coast of Africa,
+with no error anywhere.
 
 ## Observability
 
