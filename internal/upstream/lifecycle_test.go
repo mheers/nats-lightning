@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/testsupport/fakews"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/testsupport/fakews"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // Connected used to be derived from the time of the last message, which stayed

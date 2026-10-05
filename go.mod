@@ -1,4 +1,4 @@
-module github.com/heers-it/lightningfeed
+module github.com/mheers/nats-lightning
 
 go 1.26.0
 

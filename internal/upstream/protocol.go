@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // ProtocolVersion is the subscribe-frame version this client speaks.
@@ -70,6 +70,27 @@ func (m SrcMask) SrcForMask() (model.Source, bool) {
 	default:
 		return model.Source(0), false
 	}
+}
+
+// Sources returns every source code a mask actually selects, in bit order.
+//
+// It is the list form of SrcForMask, for the callers that need subjects rather
+// than a single code: a subscriber has to name one subject per selected network,
+// because the two networks issue independent id sequences and therefore publish
+// under different subjects. Bits that resolve to no source are skipped, since
+// they were observed to carry no data and a subject for them is one nothing is
+// ever published to.
+func (m SrcMask) Sources() []model.Source {
+	var out []model.Source
+	for _, bit := range []SrcMask{MaskReserved, MaskBlitzortung, MaskLightningMaps, MaskTesting} {
+		if m&bit == 0 {
+			continue
+		}
+		if src, ok := bit.SrcForMask(); ok {
+			out = append(out, src)
+		}
+	}
+	return out
 }
 
 // DefaultSrcMask is the source selection this project subscribes with.

@@ -3,8 +3,8 @@ package store_test
 import (
 	"context"
 
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // ctxBackground is a short-lived context for tests that do not exercise

@@ -18,11 +18,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/heers-it/lightningfeed/internal/config"
-	"github.com/heers-it/lightningfeed/internal/feed"
-	"github.com/heers-it/lightningfeed/internal/ingest"
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/config"
+	"github.com/mheers/nats-lightning/internal/feed"
+	"github.com/mheers/nats-lightning/internal/ingest"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=...".
@@ -61,7 +61,10 @@ use only. The upstream's terms require consumers to read from a separate server
 rather than connecting to Blitzortung directly; this process holds that single
 connection on your behalf.`),
 		SilenceUsage: true,
-		Version:      buildVersion(),
+		// main prints the error itself, prefixed with the program name. Without
+		// this cobra prints it first as well, so every failure appeared twice.
+		SilenceErrors: true,
+		Version:       buildVersion(),
 	}
 
 	root.AddCommand(newIngestCmd())
@@ -254,21 +257,16 @@ subjects, and printing them avoids reimplementing the cell enumeration.`),
 
 // selectedSources returns the source codes a mask actually subscribes to.
 //
-// Bits that resolve to no source are skipped rather than reported, because the
-// reserved and testing networks were observed to carry no data at all. Returning
-// them would print subjects nothing is ever published to.
+// It delegates to upstream.SrcMask.Sources so that this command and the demo
+// consumer cannot drift apart on which networks a mask selects: a subscriber
+// working from a different list than the bridge publishes to sees nothing at
+// all, and a mask selecting two networks with only one of them named here gets
+// an incomplete subscription list rather than an error.
 func selectedSources(mask upstream.SrcMask) []int {
-	var out []int
-	for _, bit := range []upstream.SrcMask{
-		upstream.MaskReserved, upstream.MaskBlitzortung,
-		upstream.MaskLightningMaps, upstream.MaskTesting,
-	} {
-		if mask&bit == 0 {
-			continue
-		}
-		if code, ok := bit.SrcForMask(); ok {
-			out = append(out, int(code))
-		}
+	sources := mask.Sources()
+	out := make([]int, 0, len(sources))
+	for _, s := range sources {
+		out = append(out, int(s))
 	}
 	return out
 }

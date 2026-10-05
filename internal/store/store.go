@@ -30,8 +30,8 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go driver, registers "sqlite"
 
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // schemaVersion is bumped whenever migrations change.

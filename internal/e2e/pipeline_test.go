@@ -11,8 +11,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/store"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/store"
 )
 
 // The pipeline, run as a program.

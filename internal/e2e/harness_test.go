@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/testsupport/fakews"
-	"github.com/heers-it/lightningfeed/internal/testsupport/natsd"
+	"github.com/mheers/nats-lightning/internal/testsupport/fakews"
+	"github.com/mheers/nats-lightning/internal/testsupport/natsd"
 )
 
 // This file, and the tests beside it, run the compiled binary as a real process.

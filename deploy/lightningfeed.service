@@ -12,7 +12,7 @@
 
 [Unit]
 Description=lightningfeed: lightning strokes onto NATS
-Documentation=https://github.com/heers-it/lightningfeed
+Documentation=https://github.com/mheers/nats-lightning
 After=network-online.target
 Wants=network-online.target
 

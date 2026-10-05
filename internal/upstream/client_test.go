@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/testsupport/fakews"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/testsupport/fakews"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // Slice 8: the client, exercised against a real WebSocket server.

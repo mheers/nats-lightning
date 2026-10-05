@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // Defaults chosen from measurement rather than taste.
@@ -242,6 +242,18 @@ func Parse(args []string, getenv func(string) string) (*Config, error) {
 		return nil, err
 	}
 	cfg.markSupplied(fs)
+
+	// A bare word where a flag was expected is a mistake, and the flag package
+	// cannot report it: it stops parsing at the first non-flag argument and leaves
+	// it in Args, so anything after a forgotten "--" or a mistyped flag name is
+	// discarded without a word. A region silently narrowed to the wrong one, or a
+	// SQLite path that quietly stayed the default, is much harder to notice than a
+	// refusal.
+	if fs.NArg() > 0 {
+		return nil, fmt.Errorf(
+			"config: unexpected argument %q; every setting is a flag, so a value without its "+
+				"flag name is a typo. Flags are %s", fs.Arg(0), strings.Join(flagNames(fs), ", "))
+	}
 
 	if err := setLevel(&cfg.LogLevel, logLevel); err != nil {
 		return nil, fmt.Errorf("config: --log-level: %w", err)
@@ -476,6 +488,16 @@ func (c Config) Logger() *slog.Logger {
 		return slog.New(slog.NewTextHandler(os.Stderr, opts))
 	}
 	return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+}
+
+// flagNames lists a flag set's names in the order they were defined, for error
+// messages that have to suggest the right flag without naming all of them.
+func flagNames(fs *flag.FlagSet) []string {
+	var names []string
+	fs.VisitAll(func(f *flag.Flag) {
+		names = append(names, "--"+f.Name)
+	})
+	return names
 }
 
 // ParseFromEnv is Parse with the process environment, for use in main.

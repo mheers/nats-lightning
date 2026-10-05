@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/store"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/store"
 )
 
 // Slice 11: persistence.

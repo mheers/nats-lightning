@@ -13,7 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // Viewport is the geographic box the upstream is asked to stream.

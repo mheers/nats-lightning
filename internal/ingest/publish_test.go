@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/dedup"
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/dedup"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // pub is the publishing surface publishWithRetry needs, so the retry policy can

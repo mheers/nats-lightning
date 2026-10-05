@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // Slice 7: ParseFrame turns one upstream WebSocket frame into strokes.

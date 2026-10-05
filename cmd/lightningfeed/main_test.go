@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // clearEnv neutralises every LIGHTNINGFEED_ variable for the duration of a test.

@@ -10,9 +10,9 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/heers-it/lightningfeed/internal/feed"
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/testsupport/natsd"
+	"github.com/mheers/nats-lightning/internal/feed"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/testsupport/natsd"
 )
 
 // Slice 9: publishing strokes to NATS.

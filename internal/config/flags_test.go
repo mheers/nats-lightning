@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/config"
+	"github.com/mheers/nats-lightning/internal/config"
 )
 
 // The log level flag was registered, assigned to a local variable, and then
@@ -289,6 +289,46 @@ func TestEveryDocumentedEnvironmentVariableReachesItsField(t *testing.T) {
 					tc.env, tc.value, got)
 			}
 		})
+	}
+}
+
+// A bare word where a flag was expected is discarded by the flag package without a
+// word, so the parser has to notice it itself. A dropped argument is the quietest
+// misconfiguration there is: a region narrowed to the wrong circle, or a SQLite
+// path that stayed the default, with every log line looking healthy.
+func TestUnexpectedPositionalArgumentsAreRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"stray word", []string{"cells", "strayarg"}},
+		{"value whose flag name was forgotten", []string{"--region-lat=48", "48.14"}},
+		{"trailing word", []string{"--log-level=info", "ingest"}},
+		{"positional help", []string{"help"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Parse(tc.args, env(nil))
+			if err == nil {
+				t.Fatalf("Parse(%v) succeeded, want an error naming the stray argument", tc.args)
+			}
+			if !strings.Contains(err.Error(), "unexpected argument") {
+				t.Errorf("error does not explain the problem: %v", err)
+			}
+		})
+	}
+}
+
+// The error has to be actionable: a refusal that does not say which flags exist
+// leaves the reader to guess which word was meant to be one.
+func TestUnexpectedArgumentErrorListsTheFlags(t *testing.T) {
+	_, err := config.Parse([]string{"--log-level=info", "strayarg"}, env(nil))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, flag := range []string{"--region-lat", "--nats-url", "--sqlite"} {
+		if !strings.Contains(err.Error(), flag) {
+			t.Errorf("error does not mention %s: %v", flag, err)
+		}
 	}
 }
 

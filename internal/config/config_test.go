@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/config"
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/config"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // Slice 13: configuration.

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/store"
+	"github.com/mheers/nats-lightning/internal/store"
 )
 
 // StrokesSince is the world-wide read behind `lightningfeed history` when no

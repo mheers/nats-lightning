@@ -18,15 +18,15 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/heers-it/lightningfeed/internal/config"
-	"github.com/heers-it/lightningfeed/internal/dedup"
-	"github.com/heers-it/lightningfeed/internal/elect"
-	"github.com/heers-it/lightningfeed/internal/feed"
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/obs"
-	"github.com/heers-it/lightningfeed/internal/store"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/config"
+	"github.com/mheers/nats-lightning/internal/dedup"
+	"github.com/mheers/nats-lightning/internal/elect"
+	"github.com/mheers/nats-lightning/internal/feed"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/obs"
+	"github.com/mheers/nats-lightning/internal/store"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // Runner is a handle to a running pipeline.

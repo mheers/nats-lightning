@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/elect"
-	"github.com/heers-it/lightningfeed/internal/testsupport/natsd"
+	"github.com/mheers/nats-lightning/internal/elect"
+	"github.com/mheers/nats-lightning/internal/testsupport/natsd"
 )
 
 // Slice 12: leader election.

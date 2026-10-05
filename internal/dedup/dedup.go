@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 // DefaultReconnectWindow is how far back the upstream replays on connect,

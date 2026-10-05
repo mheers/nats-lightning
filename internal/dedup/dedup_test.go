@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/dedup"
-	"github.com/heers-it/lightningfeed/internal/model"
+	"github.com/mheers/nats-lightning/internal/dedup"
+	"github.com/mheers/nats-lightning/internal/model"
 )
 
 func stroke(src model.Source, id int64) model.Stroke {

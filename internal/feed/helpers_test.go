@@ -3,9 +3,9 @@ package feed_test
 import (
 	"testing"
 
-	"github.com/heers-it/lightningfeed/internal/feed"
-	"github.com/heers-it/lightningfeed/internal/geo"
-	"github.com/heers-it/lightningfeed/internal/testsupport/natsd"
+	"github.com/mheers/nats-lightning/internal/feed"
+	"github.com/mheers/nats-lightning/internal/geo"
+	"github.com/mheers/nats-lightning/internal/testsupport/natsd"
 )
 
 // feedPublisher starts a publisher against the test broker, optionally adjusted.

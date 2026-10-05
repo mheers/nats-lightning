@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/heers-it/lightningfeed/internal/model"
-	"github.com/heers-it/lightningfeed/internal/testsupport/fakews"
-	"github.com/heers-it/lightningfeed/internal/upstream"
+	"github.com/mheers/nats-lightning/internal/model"
+	"github.com/mheers/nats-lightning/internal/testsupport/fakews"
+	"github.com/mheers/nats-lightning/internal/upstream"
 )
 
 // Slice 8b: the source bitmask.
@@ -140,6 +140,37 @@ func TestClientReceivesNothingWhenNoNetworkIsSelected(t *testing.T) {
 
 	if n := len(got.snapshot()); n != 0 {
 		t.Errorf("got %d strokes for a mask that selects no network, want 0", n)
+	}
+}
+
+// The list form is what a subscriber works from, because each network publishes
+// under its own subject. A mask selecting two networks has to yield both codes,
+// and the two bits that carry nothing must not appear at all: a subject for a
+// network with no data is one nothing is ever published to.
+func TestSourcesListsExactlyTheCarryingNetworks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mask upstream.SrcMask
+		want []model.Source
+	}{
+		{"lightningmaps.org", upstream.MaskLightningMaps, []model.Source{model.SourceLightningMaps}},
+		{"blitzortung.org", upstream.MaskBlitzortung, []model.Source{model.SourceBlitzortung}},
+		{"both networks", upstream.MaskBlitzortung | upstream.MaskLightningMaps,
+			[]model.Source{model.SourceBlitzortung, model.SourceLightningMaps}},
+		{"nothing carries data", upstream.MaskReserved | upstream.MaskTesting, nil},
+		{"empty mask", 0, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.mask.Sources()
+			if len(got) != len(tc.want) {
+				t.Fatalf("Sources() = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("Sources()[%d] = %v, want %v", i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
 
