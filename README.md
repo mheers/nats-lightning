@@ -51,18 +51,28 @@ upstream.
 
 ## Quick start
 
-```bash
-cp .env.example .env
-$EDITOR .env            # set your latitude, longitude and radius
-docker compose up -d
-```
-
-That is a broker with JetStream and the bridge, publishing every stroke within your
-radius. To watch it:
+One command, on a fresh clone:
 
 ```bash
-docker compose --profile demo run --rm demo
+make demo
 ```
+
+That creates `.env`, starts a broker and the bridge, waits for a live upstream
+connection, and draws what arrives. It runs **world-wide** by default, because
+world-wide is reliably busy — measured at roughly 20 strokes a second — while any
+particular circle is quiet most of the time. A demo pointed at a quiet region shows
+nothing at all, which looks exactly like a broken install.
+
+To narrow it, put your coordinates in `.env` (the region block in `.env.example`
+explains what the three values mean):
+
+```bash
+make demo NAME=munich LAT=48.14 LON=11.58 RADIUS_KM=25 DURATION=120s
+```
+
+That writes the region into `.env` and restarts the bridge, so both processes always
+agree on which region is in force. It will show nothing unless there is a storm over
+that circle right now, which is normal.
 
 The demo draws a live map of the region in your terminal:
 
@@ -112,6 +122,33 @@ docker compose --profile demo run --rm -T demo --view log
 **A quiet region produces nothing for hours.** That is normal, not a fault, and the
 demo says so rather than sitting silent.
 
+### Make targets
+
+`make` on its own lists them. The ones worth knowing:
+
+| Target | What it does |
+|---|---|
+| `make demo` | the whole thing: broker, bridge, live demo |
+| `make demo-log` | the same, as log lines for piping |
+| `make up` / `make down` | start / stop the stack, deleting volumes on `down` |
+| `make logs` / `make metrics` | follow the bridge's logs, scrape its metrics once |
+| `make subjects` | print the subjects this region publishes to |
+| `make build` | both binaries into `./bin` |
+| `make test` / `make test-race` | the suite, with and without the race detector |
+| `make lint` | `gofmt` check and `go vet` |
+| `make ci` | everything CI runs |
+| `make docker-build` | the container image for this machine |
+| `make docker-push` | push to Docker Hub as `mheers/nats-lightning` |
+| `make docker-pushx` | push a multi-architecture image |
+
+`make demo` rebuilds the image before running, so it always shows the current source
+rather than whatever was built last.
+
+For `docker-push` the version is the last git tag, so a release is
+`git tag && make docker-push` with nothing to edit. `latest` is a separate target,
+because overwriting a mutable tag from a branch would leave it pointing at something
+nobody tested. `docker login` first if this is your first push.
+
 ### Without Docker
 
 ```bash
@@ -144,7 +181,7 @@ either disagreeing about the region.
 | `--nats-url` | `LIGHTNINGFEED_NATS_URL` | `nats://127.0.0.1:4222` |
 | `--stream` | `LIGHTNINGFEED_STREAM` | `LIGHTNING` |
 | `--region-name` | `LIGHTNINGFEED_REGION_NAME` | the coordinates |
-| `--region-lat` / `--region-lon` / `--region-radius-km` | `LIGHTNINGFEED_REGION_LAT` … | none |
+| `--region-lat` / `--region-lon` / `--region-radius-km` | `LIGHTNINGFEED_REGION_LAT` … | none, which is world-wide |
 | `--boundary-policy` | `LIGHTNINGFEED_BOUNDARY_POLICY` | `include` |
 | `--upstream-url` | `LIGHTNINGFEED_UPSTREAM_URL` | `wss://live.lightningmaps.org:443/` |
 | `--src-mask` | `LIGHTNINGFEED_SRC_MASK` | `4` (lightningmaps.org) |
@@ -157,10 +194,10 @@ either disagreeing about the region.
 | `--reconnect-min` / `--reconnect-max` / `--idle-timeout` / `--handshake-timeout` | flags only | measured, see below |
 | `--backfill-drop` / `--dedupe-ttl` / `--prune-every` / `--leader-key` | flags only | see `internal/config` |
 
-`.env.example` documents each one, including the three that are commented out
-because they are rarely worth changing. Every variable in it is honoured by the
-parser, and a variable that is not recognised is a startup error rather than a
-silent default.
+`.env.example` documents each one, and ships with the region commented out: a
+world-wide feed shows something the moment it starts, and a specific circle is quiet
+most of the time. Every variable in it is honoured by the parser, and a variable that
+is not recognised is a startup error rather than a silent default.
 
 **A word where a flag was expected is an error**, not a silently discarded
 argument. A dropped `--region-radius-km` that quietly left the default in place is
@@ -184,6 +221,10 @@ publish world-wide, which needs no cell list at all.
 
 Regions that cross the antimeridian (Fiji, Kiribati, the Chatham Islands) are
 handled: the cell list wraps.
+
+A world-wide feed runs at roughly 20 strokes a second and the archive holds about
+1.5 kB per stroke, so the default seven-day retention is several GB. Narrow the
+region, or lower `LIGHTNINGFEED_RETENTION`, if that matters.
 
 **JetStream is not optional.** The publisher registers a message id per stroke and
 relies on the broker's duplicate window to absorb a reconnect replay, which Core NATS
@@ -498,6 +539,9 @@ anything shared.
 
 ## Testing
 
+`make ci` runs the first three of these. `go test ./...` deliberately excludes the
+live-upstream tests, which sit behind a build tag.
+
 ```bash
 go test ./...                       # unit and integration, no network
 go test -race ./...
@@ -526,6 +570,7 @@ real publisher rather than against events it built itself.
 ## Layout
 
 ```
+Makefile                   build, test, run and publish
 cmd/lightningfeed/        the bridge: ingest, history, cells
 cmd/lightningfeed-demo/   the demo consumer
 internal/

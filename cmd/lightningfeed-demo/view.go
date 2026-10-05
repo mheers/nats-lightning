@@ -51,6 +51,8 @@ type projection struct {
 	lonSpan  float64 // east to west, degrees
 	rows     int
 	cols     int
+	gutter   int // width of the latitude column, from the widest label
+	dec      int // decimal places in the labels, enough to keep them distinct
 	region   geo.Circle
 }
 
@@ -64,6 +66,7 @@ func newProjection(region geo.Circle, cols int) projection {
 		// there and the top and bottom rows would otherwise be permanently empty.
 		p.lat, p.lon = 0, 0
 		p.latSpan, p.lonSpan = 170, 360
+		p.gutter = p.latFieldWidth()
 		return p
 	}
 
@@ -81,7 +84,57 @@ func newProjection(region geo.Circle, cols int) projection {
 	// silently covers half the planet.
 	cosLat := math.Max(0.05, math.Cos(region.Lat*math.Pi/180))
 	p.lonSpan = spanKm / (kmPerDegLat * cosLat)
+
+	p.dec = p.chooseDecimals()
+	p.gutter = p.latFieldWidth()
 	return p
+}
+
+// latFieldWidth is the width of the latitude column: the widest label this window
+// produces.
+//
+// It is measured rather than fixed because the label's precision follows the
+// window's span. A fixed gutter that fits "85N" is one character too narrow for the
+// "35.33N" a 25 km region needs, and every row whose label overflowed would then
+// shift its map one column left of the rows around it — a ragged edge through the
+// middle of the picture.
+func (p projection) latFieldWidth() int {
+	wide := 0
+	for row := 0; row < p.rows; row += labelEvery {
+		lat, _ := p.position(0, row)
+		if n := len([]rune(formatDegrees(lat, true, p.dec))); n > wide {
+			wide = n
+		}
+	}
+	return wide
+}
+
+// chooseDecimals is the fewest decimal places that keep every latitude label
+// distinct.
+//
+// Distinctness, rather than the window's span, is the requirement: a 25 km region
+// spans about half a degree, so whole degrees would print "35N" six times running,
+// and one decimal still repeats because labelled rows are only about 0.08 degrees
+// apart. A label that says the same as the label above it carries no information,
+// whatever the precision.
+func (p projection) chooseDecimals() int {
+	for d := range 7 {
+		seen := make(map[string]struct{}, p.rows/labelEvery+1)
+		distinct := true
+		for row := 0; row < p.rows; row += labelEvery {
+			lat, _ := p.position(0, row)
+			label := formatDegrees(lat, true, d)
+			if _, dup := seen[label]; dup {
+				distinct = false
+				break
+			}
+			seen[label] = struct{}{}
+		}
+		if distinct {
+			return d
+		}
+	}
+	return 6
 }
 
 // position returns the coordinates at the centre of one grid cell.
@@ -192,12 +245,147 @@ func renderMap(p projection, markers []marker, now time.Time, fade time.Duration
 		}
 	}
 
-	lines := make([]string, 0, p.rows+2)
-	for _, row := range canvas {
-		lines = append(lines, "  "+strings.TrimRight(string(row), " "))
+	lines := make([]string, 0, p.rows+4)
+	for row, cells := range canvas {
+		lines = append(lines, p.latLabel(row)+" "+string(cells))
 	}
-	lines = append(lines, "  * now   + recent   : fading   · inside radius   @ region centre")
+	indent := strings.Repeat(" ", p.gutter+1)
+	lines = append(lines, indent+p.lonLabels())
+	lines = append(lines, indent+p.legend())
 	return lines
+}
+
+// legend explains the glyphs, and only the ones this view can actually show.
+//
+// The region fill and the centre are absent from a world-wide view because there
+// is no region, and a legend naming a circle that is not drawn sends the reader
+// looking for it.
+func (p projection) legend() string {
+	if p.region.RadiusKm <= 0 {
+		return "* now   + recent   : fading"
+	}
+	return "* now   + recent   : fading   · inside radius   @ region centre"
+}
+
+// labelEvery is how many rows between two latitude labels.
+//
+// Labelling every row would be unreadable at 22 rows and would cost more width
+// than the map itself. Every third is enough to place a feature against the grid
+// while leaving the strokes as the widest thing on the line.
+const labelEvery = 3
+
+// latLabel is the left-hand latitude label for a row, or blank where there is none.
+//
+// Without this the world-wide view is an unlabelled grid: there is no way to tell
+// whether a cluster is over the Atlantic or over Africa, which is the only question
+// a world-wide map exists to answer.
+func (p projection) latLabel(row int) string {
+	if row%labelEvery != 0 {
+		return strings.Repeat(" ", p.gutter)
+	}
+	lat, _ := p.position(0, row)
+	return fmt.Sprintf("%*s", p.gutter, formatDegrees(lat, true, p.dec))
+}
+
+// niceSteps are the intervals a coordinate label may fall on, coarsest first.
+//
+// Labels are placed on round numbers rather than on evenly spaced columns, because
+// a reader can only place a feature against "60W"; "54E" tells them nothing they
+// could act on, and a world-wide map whose ticks are all arbitrary numbers is a
+// grid with decoration on it.
+var niceSteps = []float64{180, 90, 60, 45, 30, 20, 15, 10, 5, 2, 1, 0.5, 0.2, 0.1, 0.05}
+
+// lonLabels is the bottom row of longitude labels, each under the column that holds
+// its meridian.
+func (p projection) lonLabels() string {
+	row := make([]rune, p.cols)
+	for i := range row {
+		row[i] = ' '
+	}
+
+	west, east := p.lon-p.lonSpan/2, p.lon+p.lonSpan/2
+	step := p.labelStep(p.lonSpan)
+
+	// The first multiple of step at or after the western edge, so the series starts
+	// on a round number rather than wherever the window happens to begin.
+	lon := math.Ceil(west/step) * step
+
+	for ; lon <= east+step/1000; lon += step {
+		col, _, ok := p.project(p.lat, lon)
+		if !ok {
+			continue
+		}
+		label := []rune(formatDegrees(lon, false, p.dec))
+
+		// Clamped to the grid rather than allowed to hang off either end, so the row
+		// stays exactly as wide as the map above it.
+		start := clamp(col-len(label)/2, 0, p.cols-len(label))
+
+		// One column of clearance, and a label is dropped rather than drawn touching
+		// its neighbour. "24.20E24.30E24.40E" is technically three labels and is
+		// unreadable in practice; halving the count for legibility is the better
+		// trade, and the map above is unchanged either way.
+		if start > 0 && row[start-1] != ' ' {
+			continue
+		}
+		if occupied(row, start, len(label)) {
+			continue // would overwrite the previous label
+		}
+		copy(row[start:], label)
+	}
+	return strings.TrimRight(string(row), " ")
+}
+
+// labelStep picks the largest round interval that still labels the window about
+// four times over.
+//
+// The comparison is <= and not >=, and the direction matters: taking the coarsest
+// interval that merely exceeds the target halves the number of labels instead of
+// keeping it, so a world-wide map would carry two where it should carry five.
+func (p projection) labelStep(span float64) float64 {
+	target := span / 4
+	step := niceSteps[len(niceSteps)-1]
+	for _, s := range niceSteps {
+		if s <= target {
+			step = s
+			break
+		}
+	}
+	return step
+}
+
+// occupied reports whether [start, start+n) of row already holds a label.
+func occupied(row []rune, start, n int) bool {
+	for i := start; i < start+n && i < len(row); i++ {
+		if row[i] != ' ' {
+			return true
+		}
+	}
+	return false
+}
+
+// formatDegrees renders a coordinate as a magnitude and a hemisphere letter.
+//
+// The magnitude, not the signed value: "-180W" says the same as "180W" and looks
+// like a typo, and the sign is already carried by the letter.
+func formatDegrees(v float64, isLat bool, decimals int) string {
+	hemisphere := "E"
+	switch {
+	case isLat && v < 0:
+		hemisphere = "S"
+	case isLat:
+		hemisphere = "N"
+	case v < 0:
+		hemisphere = "W"
+	}
+
+	// The prime meridian and the equator get a bare zero: "0.0E" is a decimal
+	// place of noise on the one coordinate that is exactly round, and it is the
+	// label a reader is most likely to be looking for.
+	if v == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%.*f%s", decimals, math.Abs(v), hemisphere)
 }
 
 // canvas paints the region onto an empty grid.

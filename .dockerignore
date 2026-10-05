@@ -28,10 +28,12 @@ bin/
 data/
 tmp/
 
-# Not a build input, and it is where a real .env would live if one were copied in.
+# Not build inputs, and .env is where a reader's own configuration would live if one
+# were ever copied into a build context.
 .env
 .env.*
 !.env.example
+Makefile
 docker-compose*.yml
 Dockerfile
 .dockerignore

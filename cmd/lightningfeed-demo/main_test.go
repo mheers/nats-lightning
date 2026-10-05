@@ -290,8 +290,103 @@ func TestMapHeightIsStable(t *testing.T) {
 	if len(empty) != len(full) {
 		t.Errorf("frame height changed from %d to %d lines", len(empty), len(full))
 	}
-	if len(empty) != mapRows+1 {
-		t.Errorf("frame is %d lines, want %d map rows plus a legend", len(empty), mapRows+1)
+	// The map itself, a row of longitude labels, and a legend.
+	if want := mapRows + 2; len(empty) != want {
+		t.Errorf("frame is %d lines, want %d: %d map rows, longitude labels and a legend",
+			len(empty), want, mapRows)
+	}
+}
+
+// The map has to say where it is. Without coordinates on the edges a world-wide view
+// is an unlabelled grid, and there is no way to tell a cluster over the Atlantic
+// from one over Africa — which is the only question a world-wide map exists to
+// answer.
+func TestMapIsLabelledWithCoordinates(t *testing.T) {
+	world := newProjection(geo.Circle{}, mapCols)
+	lines := renderMap(world, nil, time.Now(), defaultFade)
+
+	// Every line, gutters aside, has to fit the grid, or the strokes will not sit
+	// above the coordinates printed beneath them.
+	widest := mapCols + world.gutter + 1
+	for i, line := range lines {
+		if n := len([]rune(line)); n > widest {
+			t.Errorf("line %d is %d wide, wider than the map's %d: %q", i, n, widest, line)
+		}
+	}
+
+	// The world-wide window runs from 85N to 85S, so the top row's label is the
+	// northern edge of it and the bottom row's is the southern.
+	if lat := lines[0]; !strings.Contains(lat, "85N") {
+		t.Errorf("the first row carries no latitude label: %q", lat)
+	}
+	if lat := lines[mapRows-1]; !strings.Contains(lat, "85S") {
+		t.Errorf("the last row carries no latitude label: %q", lat)
+	}
+
+	// Labels go on round meridians, because that is the only kind a reader can place
+	// a feature against.
+	lon := lines[mapRows]
+	for _, want := range []string{"180W", "90W", "90E", "180E"} {
+		if !strings.Contains(lon, want) {
+			t.Errorf("longitude row %q does not mention %q", lon, want)
+		}
+	}
+}
+
+// Labels have to be distinguishable. A 25 km region spans about a third of a degree,
+// so whole-degree labels all read "35N" and the grid conveys nothing — and the
+// longitude row must line up with the map above it, which means sharing its gutter.
+func TestRegionalLabelsAreDistinguishableAndAligned(t *testing.T) {
+	region := geo.Circle{Lat: 35.3340688, Lon: 24.4944483, RadiusKm: 25}
+	p := newProjection(region, mapCols)
+	lines := renderMap(p, nil, time.Now(), defaultFade)
+
+	var lats []string
+	for row := 0; row < mapRows; row += labelEvery {
+		fields := strings.Fields(lines[row])
+		if len(fields) == 0 {
+			t.Fatalf("row %d has no latitude label: %q", row, lines[row])
+		}
+		lats = append(lats, fields[0])
+	}
+	seen := map[string]bool{}
+	for _, l := range lats {
+		if seen[l] {
+			t.Errorf("latitude label %q appears twice, so the grid says nothing", l)
+		}
+		seen[l] = true
+	}
+	if len(lats) < 3 {
+		t.Errorf("only %d latitude labels for a %d row grid", len(lats), mapRows)
+	}
+
+	// The coordinate row and the legend both start under the grid, not under the
+	// gutter, or they appear to label the labels.
+	indent := len(lats[0]) + 1
+	for _, line := range []string{lines[mapRows], lines[mapRows+1]} {
+		if n := len(line) - len(strings.TrimLeft(line, " ")); n != indent {
+			t.Errorf("row starts at column %d, want %d: %q", n, indent, line)
+		}
+	}
+	if !strings.Contains(lines[mapRows+1], "inside radius") {
+		t.Errorf("the legend is not where the coordinates are: %q", lines[mapRows+1])
+	}
+}
+
+// A world-wide view has no region, so the legend must not send the reader looking
+// for a circle that was never drawn.
+func TestLegendOnlyMentionsWhatIsDrawn(t *testing.T) {
+	world := newProjection(geo.Circle{}, mapCols).legend()
+	if strings.Contains(world, "inside radius") || strings.Contains(world, "region centre") {
+		t.Errorf("the world-wide legend describes a region: %q", world)
+	}
+	if !strings.Contains(world, "now") {
+		t.Errorf("the world-wide legend does not explain the stroke glyphs: %q", world)
+	}
+
+	region := newProjection(roussospiti, mapCols).legend()
+	if !strings.Contains(region, "inside radius") || !strings.Contains(region, "region centre") {
+		t.Errorf("the regional legend omits the region: %q", region)
 	}
 }
 
