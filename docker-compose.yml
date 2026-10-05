@@ -1,0 +1,95 @@
+# A working stack: a broker with JetStream, the bridge, and a demo consumer.
+#
+#   cp .env.example .env      # then set your coordinates and radius
+#   docker compose up -d
+#   docker compose --profile demo run --rm demo
+#
+# The broker's ports are published on the loopback interface only, and it runs
+# without credentials because of that. That is the right default for a stack on
+# one machine and the wrong one for anything shared: for that, use
+# deploy/nats-server.conf, which defines a user with publish and subscribe
+# permissions, and publish the port on an interface you mean to.
+
+name: nats-lightning
+
+services:
+  # JetStream is not optional. The publisher registers a message id per stroke and
+  # relies on the broker's duplicate window to absorb the upstream's five-minute
+  # reconnect replay, which Core NATS cannot do. The bridge refuses to start
+  # without it, so there is no configuration that silently loses that protection.
+  nats:
+    image: nats:2.15-alpine
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+    ports:
+      # Loopback only. The monitoring endpoint is on 8222 and reports everything
+      # the broker knows, including stream contents metadata and client names.
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # The monitoring port answers as soon as the server is ready for clients,
+      # which is what the bridge needs to hear about before it starts.
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # The bridge itself. One instance is enough and more than one is not harmful
+  # either: the leadership lease means exactly one of them connects upstream, and
+  # the rest wait. That is the design, not an accident.
+  lightningfeed:
+    build:
+      context: .
+    image: nats-lightning:local
+    env_file:
+      - .env
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      # Metrics and readiness, on loopback. Uncomment to let a Prometheus on the
+      # host scrape it; put authentication in front of it before doing that.
+      - "127.0.0.1:9109:9109"
+    volumes:
+      # The SQLite archive and the cursor. It belongs to the leader, so it must
+      # not be a shared volume between replicas: two processes writing one
+      # database file is the failure the lease exists to prevent.
+      - lightningfeed-data:/var/lib/lightningfeed
+    restart: unless-stopped
+
+  # The demo consumer. Behind a profile so `docker compose up` does not start it:
+  # it is something to run when you want to look, not something to leave running.
+  #
+  # `run` rather than `up` because compose allocates a terminal for it, which is
+  # what the map view needs. With -T, or on a pipe, it prints one line per stroke
+  # instead.
+  demo:
+    build:
+      context: .
+    image: nats-lightning:local
+    profiles:
+      - demo
+    command:
+      - "lightningfeed-demo"
+      - "--view"
+      - "map"
+    env_file:
+      - .env
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  # JetStream's file store. Bounded by the stream's own limits policy at two
+  # hours; this volume is what keeps those two hours across a restart.
+  nats-data:
+  lightningfeed-data:

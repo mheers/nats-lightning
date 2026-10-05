@@ -1,17 +1,31 @@
-# lightningfeed — Real-time lightning strokes onto NATS
+# Upstream findings
 
-**Status:** discovery complete, plan ready, scope resolved
-**Date:** 2026-10-03 (updated 2026-10-04)
-**Question:** can we take the real-time feed behind the `www.lightningmaps.org` URL in the request and publish lightning strikes to a NATS topic, in Go?
+The evidence behind this project's design decisions, kept because most of them look
+arbitrary until you know what was measured.
 
-**Answer: yes — and the bridge is exactly the shape their terms require.**
+`lightningmaps.org` publishes no documentation for its feed, so the protocol in
+`internal/upstream` was derived from the client JavaScript the site serves and
+then verified against the running service. Everything below was checked live on
+2026-10-03 and 2026-10-04, not inferred from documentation. Where a number appears,
+it was observed rather than estimated.
 
-**Scope (decided 2026-10-04):** private, non-commercial, single region — **every lightning strike
-within 10 km of Roussospiti, Crete** (35.3340688, 24.4944483), republished as CloudEvents on NATS
-JetStream, archived in SQLite. `boundary` strokes count as inside.
+The parts worth reading before changing anything:
 
-All findings below were verified live against the running service on 2026-10-03, not inferred from
-documentation.
+- **§1.7** the upstream throttles new connections severely, which is why the
+  bridge holds a leadership lease and has a 15 s floor on reconnect
+- **§1.10** the licensing terms, which are the real constraint on this project and
+  are stricter than the licence on the code
+- **§1.3** the WebSocket protocol, including the two transports that disagree about
+  types
+- **§1.6** three traps that produce wrong data rather than errors
+- **§2.3** the subject scheme, and why the source code is part of the subject
+
+Sections 2.x are the design as built. The README describes what the program
+actually does; this document is the longer account of why.
+
+The original question was whether the feed behind the `www.lightningmaps.org` URL
+could be republished onto a NATS topic in Go. It can, and the bridge is exactly the
+shape the upstream's terms require.
 
 ## 1.1 What the URL actually is
 

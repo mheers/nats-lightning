@@ -1,7 +1,18 @@
 # build output
 /lightningfeed
+/lightningfeed-demo
 /bin/
 /dist/
+
+# local configuration
+#
+# .env holds the region and any deployment-specific settings, and it is the one
+# file in this repository that must never be committed: it is where a reader's
+# coordinates, and anything they add, end up. .env.example is the committed
+# template.
+/.env
+/.env.local
+/.env.*.local
 
 # local state
 *.db

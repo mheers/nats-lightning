@@ -1,0 +1,37 @@
+# Build context exclusions.
+#
+# The image copies go.mod, go.sum, cmd/ and internal/, so anything else is only
+# sent to the daemon and discarded. .git is the large one: without this, every
+# build transfers the whole history and a change to a commit re-invalidates the
+# dependency layer's cache.
+
+.git
+.gitignore
+.github
+
+# Documentation and the local design notes are not compiled in.
+*.md
+!go.mod
+!go.sum
+docs/
+LICENSE
+
+# Build output and local state, which would otherwise be copied over the fresh
+# binaries in the image.
+dist/
+bin/
+/lightningfeed
+/lightningfeed-demo
+*.db
+*.db-wal
+*.db-shm
+data/
+tmp/
+
+# Not a build input, and it is where a real .env would live if one were copied in.
+.env
+.env.*
+!.env.example
+docker-compose*.yml
+Dockerfile
+.dockerignore
