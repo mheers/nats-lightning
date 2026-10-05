@@ -58,14 +58,20 @@ jobs:
 
       # The version has to survive into the binary, because a deployed image that
       # reports "(devel)" cannot be traced back to a commit.
+      # Both binaries, because the demo is the one a reader runs first and a
+      # version that reads "dev" in a tagged release is the same untangleable
+      # problem whichever binary it is in.
       - name: the image knows its version
         run: |
-          reported=$(docker compose run --rm --no-deps --entrypoint lightningfeed lightningfeed --version)
-          echo "reported: $reported"
-          case "$reported" in
-            *"${{ github.sha }}") echo "version stamped" ;;
-            *) echo "version not stamped into the image"; exit 1 ;;
-          esac
+          for binary in lightningfeed lightningfeed-demo; do
+            reported=$(docker compose run --rm --no-deps \
+              --entrypoint "$binary" "$binary" --version 2>/dev/null)
+            echo "$binary reports: $reported"
+            case "$reported" in
+              *"${{ github.sha }}") ;;
+              *) echo "version not stamped into $binary"; exit 1 ;;
+            esac
+          done
 
       # The upstream URL is pointed at a closed port before anything starts.
       #

@@ -23,10 +23,15 @@ COPY internal/ ./internal/
 # Both binaries land in one image on purpose. The demo is how somebody checks
 # that a consumer can actually read the stream, and an image that could only run
 # the bridge would make that a local build.
+# The version is stamped into both binaries.
+#
+# The demo needs it as much as the bridge does: a consumer that reports "dev" when
+# the image it came from is a tagged release is exactly as untangleable as a bridge
+# that does, and it is the demo a reader is most likely to run first.
 ARG VERSION=dev
 ENV CGO_ENABLED=0 GOOS=linux
 RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/lightningfeed ./cmd/lightningfeed \
- && go build -trimpath -ldflags "-s -w" -o /out/lightningfeed-demo ./cmd/lightningfeed-demo
+ && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/lightningfeed-demo ./cmd/lightningfeed-demo
 
 
 # Runtime stage.
