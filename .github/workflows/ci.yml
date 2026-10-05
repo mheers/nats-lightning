@@ -1,5 +1,14 @@
 name: ci
 
+# Also deliberately does not build the image.
+#
+# `make docker-pushx` builds and pushes it, and deliberately does so here rather
+# than on every commit to main: a multi-architecture buildx push takes minutes and
+# burns a runner's disk to produce a tag nobody asked for, and publishing needs
+# Docker Hub credentials that do not belong in this repository. The image is a
+# packaging of the binaries this job does check, so `make ci` remains everything
+# that runs here.
+#
 # Deliberately does not touch the upstream.
 #
 # The live-feed tests are behind the `e2e` build tag and are not run here. The
@@ -47,102 +56,3 @@ jobs:
 
       - name: test
         run: go test -race ./...
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: build the image
-        run: docker compose build --build-arg VERSION=${{ github.sha }}
-
-      # The version has to survive into the binary, because a deployed image that
-      # reports "(devel)" cannot be traced back to a commit.
-      # Both binaries, because the demo is the one a reader runs first and a
-      # version that reads "dev" in a tagged release is the same untangleable
-      # problem whichever binary it is in.
-      - name: the image knows its version
-        run: |
-          for binary in lightningfeed lightningfeed-demo; do
-            reported=$(docker compose run --rm --no-deps \
-              --entrypoint "$binary" "$binary" --version 2>/dev/null)
-            echo "$binary reports: $reported"
-            case "$reported" in
-              *"${{ github.sha }}") ;;
-              *) echo "version not stamped into $binary"; exit 1 ;;
-            esac
-          done
-
-      # The upstream URL is pointed at a closed port before anything starts.
-      #
-      # The bridge acquires the lease, opens the store and serves metrics before it
-      # dials upstream, so a container reporting ready has proved the image works —
-      # but left to itself it would then go on dialling the real feed, on every push.
-      # Refused connections are retried on the same schedule a real outage uses, so
-      # this exercises the image without touching a third party's rate limit.
-      - name: point the upstream at nowhere
-        run: |
-          cp .env.example .env
-          sed -i 's|^LIGHTNINGFEED_UPSTREAM_URL=.*|LIGHTNINGFEED_UPSTREAM_URL=wss://127.0.0.1:1/|' .env
-
-      - name: the container comes up and serves metrics
-        run: |
-          docker compose up -d
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:9109/metrics 2>/dev/null | grep -q '^lightningfeed_config_info'; then
-              echo "metrics served after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "the bridge never served metrics"
-          docker compose logs
-          exit 1
-
-      # The container must also report itself healthy, which is the probe the
-      # Dockerfile ships and the one an orchestrator would use.
-      - name: the container reports healthy
-        run: |
-          health=starting
-          for i in $(seq 1 30); do
-            health=$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q lightningfeed)")
-            if [ "$health" = "healthy" ]; then
-              echo "healthy after ${i} polls"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "never became healthy, last status: $health"
-          docker compose logs
-          exit 1
-
-      # The demo is a second binary out of the same build, and the path a reader is
-      # most likely to take first.
-      #
-      # The stream name is overridden with -e rather than --stream because the
-      # environment wins over flags by design, and .env sets one. Passing the flag
-      # alone would silently test the configured stream and assert nothing.
-      - name: the demo binary runs
-        run: |
-          docker compose run --rm --no-deps --entrypoint lightningfeed-demo demo --help
-          docker compose run --rm --no-deps -T \
-            -e LIGHTNINGFEED_STREAM=DOES_NOT_EXIST \
-            --entrypoint lightningfeed-demo demo --duration 1s 2>&1 | grep -q 'no stream'
-
-      # The Makefile is the interface most readers will touch first, so its targets
-      # are held to the same standard as the code: each one is run, not just parsed.
-      - name: the make targets work
-        run: |
-          make help
-          make lint
-          make build
-          test -x bin/lightningfeed
-          test -x bin/lightningfeed-demo
-
-      - name: logs
-        if: failure()
-        run: docker compose logs
-
-      - name: tear down
-        if: always()
-        run: docker compose down -v
