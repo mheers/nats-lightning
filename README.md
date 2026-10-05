@@ -74,12 +74,15 @@ That writes the region into `.env` and restarts the bridge, so both processes al
 agree on which region is in force. It will show nothing unless there is a storm over
 that circle right now, which is normal.
 
-The demo draws a live map of the region in your terminal:
+To go back, delete the region lines from `.env` — an empty value is how this project
+spells "not set" — and run `make demo` again.
+
+Here is a regional run over Munich, 25 km, mid-storm:
 
 ```
 watching munich  48.1400,11.5800  within 25 km
 stream "LIGHTNING" at nats://nats:4222
-187 subject(s), consumer "lightningfeed-demo", from now
+187 subject(s), consumer "make-demo-munich", from now
 map 44x22, strokes fade after 1m30s
 
 Lightning data (c) Blitzortung.org contributors, CC BY-SA 4.0
@@ -87,30 +90,35 @@ Lightning data (c) Blitzortung.org contributors, CC BY-SA 4.0
 2m elapsed · 41 strokes · 20.5/min · last live · closest 0.83 km
 in 38  ·  boundary 3
 
-  
-                    ········
-               ··················
-            ··············:··+······
-          ···:························
-         ······························
-        ········+······+··+·············
-       ········:·+*·+··+·+···············
-      ··:········+·+···*··················
-      ·········*··+·*:·+++················
-      ·········**··:····@·+······:········
-      ·········+·:······::················
-       ·····*:····:······················
-        ·+······························
-         ···························:··
-          ····················:·······
-            ························
-               ··················
-                    ········
-  
-  * now   + recent   : fading   · inside radius   @ region centre
+48.41N
+                        :········
+48.33N              ················:·
+                 ·······················
+               ···························
+48.26N        ·····························
+             ·········+:·:······:············
+            ···········:·++··+*+···+··········
+48.18N     ············:··+··::+················
+           ··············**+·:::················
+           ···········*+··:+·:··:··············
+48.10N     ···········:+···*:·+*:··············
+            ························::·:·····+
+             ································
+48.02N        ······························
+               ···························
+                 ························
+47.95N              ······+···········
+                         ····*···
+47.87N
+       11.20E   11.40E     11.60E    11.80E
+       * now   + recent   : fading   · inside radius   @ region centre
 
   ▁▂▁▂▃▅▇▆▄▂▅█▆▄▃▂▄▅▃▂▂▃▄▃▂▂▂▂▂▁  strokes per 10s, most recent on the right
 ```
+
+Both edges are labelled, because a world-wide view with no coordinates on it cannot
+tell a cluster over the Atlantic from one over Africa — which is the only question a
+world-wide map exists to answer.
 
 It also works without a terminal, one line per stroke, which is what to use when
 piping it:
